@@ -112,4 +112,4 @@ def sign_in_user(phone: str, password: str):
 
 @app.get("/")
 def home():
-    return {"status": "Online", "system": "Sachin Academy Proxy"}
+    return {"endpoint chaheiye mere bete koo maxx papa ko message kar !"}
