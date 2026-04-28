@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+requests
+upstash-redis
+python-multipart
