@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from upstash_redis import Redis
 import random
 
-app = FastAPI(title="Sachin Academy Full Proxy API")
+app = FastAPI(title="Sachin Academy Final Proxy API")
 
 # ================= CONFIGURATION =================
 REDIS_URL = "https://winning-lioness-97755.upstash.io"
@@ -49,7 +49,7 @@ def perform_login(phone, password):
             redis.set(f"userid:{phone}", userid)
             return {"token": token, "userid": userid, "phone": phone}
     except Exception as e:
-        print(f"[ERROR] Login Failed: {e}")
+        print(f"[ERROR] Login failed: {e}")
     return None
 
 def get_valid_auth():
@@ -63,21 +63,12 @@ def get_valid_auth():
 
 def fetch_api(path, params=None):
     auth = get_valid_auth()
-    if not auth:
-        raise HTTPException(status_code=500, detail="Authentication Failed")
-
     headers = COMMON_HEADERS.copy()
-    headers.update({
-        "Authorization": auth["token"],
-        "User-Id": auth["userid"]
-    })
-
+    headers.update({"Authorization": auth["token"], "User-Id": auth["userid"]})
     response = client.get(BASE_URL + path, headers=headers, params=params, timeout=15)
-    
     if response.status_code in [401, 403]:
         redis.delete(f"token:{auth['phone']}")
         raise HTTPException(status_code=401, detail="Token Expired. Please retry.")
-
     return response.json()
 
 # ================= ENDPOINTS =================
@@ -93,25 +84,24 @@ def get_subjects(courseid: str):
 
 @app.get("/api/topics")
 def get_topics(courseid: str, subjectid: str):
-    params = {"courseid": courseid, "subjectid": subjectid, "start": "-1"}
-    return fetch_api("/get/alltopicfrmlivecourseclass", params)
+    return fetch_api("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
 
 @app.get("/api/videos")
 def get_videos(courseid: str, subjectid: str, topicid: str):
-    params = {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "1", "start": "0"}
+    """Live Course Class Endpoint (Updated Params)"""
+    params = {
+        "courseid": courseid,
+        "subjectid": subjectid,
+        "topicid": topicid,
+        "conceptid": "",
+        "windowsapp": "false",
+        "start": "0"
+    }
     return fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params)
 
-# --- Naya Video Details Endpoint ---
 @app.get("/api/video-details")
 def get_video_details(courseid: str, videoid: str):
-    """Video ki specific details (stream link, etc.) fetch karne ke liye"""
-    params = {
-        "course_id": courseid,
-        "video_id": videoid,
-        "ytflag": "0",
-        "folder_wise_course": "0",
-        "lc_app_api_url": ""
-    }
+    params = {"course_id": courseid, "video_id": videoid, "ytflag": "0", "folder_wise_course": "0"}
     return fetch_api("/get/fetchVideoDetailsById", params)
 
 @app.post("/api/login")
@@ -122,4 +112,4 @@ def sign_in_user(phone: str, password: str):
 
 @app.get("/")
 def home():
-    return {"api lega sachina academy kaa sakal dekhi hai endpoint chaiye mere bete koo jaa maxx papa ko message kar !"}
+    return {"status": "Online", "system": "Sachin Academy Proxy"}
