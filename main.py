@@ -29,6 +29,12 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
+# ================= EXCLUDE OLD BATCHES =================
+EXCLUDE_BATCHES = {
+    "8",                          # KVS INTERVIEW BATCH old (id)
+    "kvs-interview-batch-old",    # slug
+}
+
 # ================= AUTH CORE =================
 
 def perform_login(phone, password):
@@ -93,27 +99,36 @@ def fetch_api(path, params=None, auth_data=None):
 
 
 def process_batch(token, userid, combined_data, seen_ids):
-    """Helper function to process batches"""
+    """Helper function to process batches with old batch filtering"""
     result = fetch_api("/get/mycourseweb", {"userid": userid}, {"token": token, "userid": userid})
     
     if isinstance(result, dict) and result.get("status") == 200:
         batch_list = result.get("data", [])
         for batch in batch_list:
-            b_id = batch.get("id") or batch.get("course_id")
-            if b_id and b_id not in seen_ids:
-                combined_data.append(batch)
-                seen_ids.add(b_id)
+            b_id = str(batch.get("id") or batch.get("course_id") or "")
+            course_name = batch.get("course_name", "").strip()
+            course_slug = batch.get("course_slug", "").strip()
+
+            if not b_id or b_id in seen_ids:
+                continue
+
+            # Filter old batches
+            if (
+                b_id in EXCLUDE_BATCHES or 
+                course_slug in EXCLUDE_BATCHES or
+                course_name.lower() == "kvs interview batch old" or
+                ("old" in course_name.lower() and "kvs" in course_name.lower() and "interview" in course_name.lower())
+            ):
+                continue  # Skip old KVS batch
+
+            combined_data.append(batch)
+            seen_ids.add(b_id)
 
 
 # ================= ENDPOINTS =================
 
 @app.get("/api/add-token")
 async def add_manual_token(token: str, userid: str, phone: str = None):
-    """
-    Manually add token and userid to Redis
-    Usage: 
-    /api/add-token?token=eyJ...&userid=12345&phone=9140256954
-    """
     if not token or not userid:
         raise HTTPException(status_code=400, detail="token and userid are required")
 
@@ -138,7 +153,7 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
 
 @app.get("/api/my-batches")
 def get_all_merged_batches():
-    """Merge all batches from saved accounts + manual tokens"""
+    """Merge all batches from saved accounts + manual tokens (excluding old batches)"""
     combined_data = []
     seen_ids = set()
 
@@ -176,7 +191,7 @@ def get_all_merged_batches():
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully", 
+        "message": "All Batches Merged Successfully (Old batches excluded)", 
         "data": combined_data
     }
 
@@ -258,4 +273,4 @@ def home():
         "status": "Active", 
         "dev": "Maxx Papa", 
         "msg": "Sachin Academy Aggregator API is running!"
-        }
+            }
