@@ -2,6 +2,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from upstash_redis import Redis
 import random
+from concurrent.futures import ThreadPoolExecutor  # Fast execution ke liye
 
 app = FastAPI(title="Sachin Academy Final Aggregator API")
 
@@ -49,7 +50,7 @@ def perform_login(phone, password):
         resp = client.post(f"{BASE_URL}/post/userLogin?extra_details=0", 
                           headers=COMMON_HEADERS, 
                           files=payload, 
-                          timeout=15)
+                          timeout=10) # Timeout kam kiya taaki fasa na rahe
         data = resp.json()
         if resp.status_code == 200 and data.get("status") == 200:
             token = data["data"]["token"]
@@ -64,7 +65,6 @@ def perform_login(phone, password):
 
 
 def get_valid_auth():
-    """Pool mein se koi bhi ek valid auth nikaalne ke liye (for sub/topic endpoints)"""
     random.shuffle(ACCOUNTS)
     for acc in ACCOUNTS:
         token = redis.get(f"token:{acc['phone']}")
@@ -72,13 +72,11 @@ def get_valid_auth():
         if token and userid:
             return {"token": token, "userid": userid}
     
-    # Fallback login sirf baaki endpoints ke liye agar Redis mein kuch na mile
     new_auth = perform_login(ACCOUNTS[0]["phone"], ACCOUNTS[0]["pass"])
     return new_auth
 
 
 def fetch_api(path, params=None, auth_data=None):
-    """Generic fetcher with token handling"""
     auth = auth_data if auth_data else get_valid_auth()
     if not auth:
         raise HTTPException(status_code=401, detail="Authentication failed for all accounts.")
@@ -89,17 +87,19 @@ def fetch_api(path, params=None, auth_data=None):
         "User-Id": auth["userid"]
     })
     
-    response = client.get(BASE_URL + path, headers=headers, params=params, timeout=15)
-    
-    if response.status_code in [401, 403]:
-        return {"error": "reauth_needed"}
-    
-    return response.json()
+    try:
+        response = client.get(BASE_URL + path, headers=headers, params=params, timeout=8) # 8 seconds timeout
+        if response.status_code in [401, 403]:
+            return {"error": "reauth_needed"}
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def process_batch(token, userid, combined_data, seen_ids):
-    """Helper function to process batches and filter only 3 required keys"""
+def fetch_single_account_batches(token, userid):
+    """Ek single token ke liye background mein fetch karega"""
     result = fetch_api("/get/mycourseweb", {"userid": userid}, {"token": token, "userid": userid})
+    batches_found = []
     
     if isinstance(result, dict) and result.get("status") == 200:
         batch_list = result.get("data", [])
@@ -108,7 +108,7 @@ def process_batch(token, userid, combined_data, seen_ids):
             course_name = batch.get("course_name", "").strip()
             course_slug = batch.get("course_slug", "").strip()
 
-            if not b_id or b_id in seen_ids:
+            if not b_id:
                 continue
 
             # Filter old batches
@@ -120,7 +120,6 @@ def process_batch(token, userid, combined_data, seen_ids):
             ):
                 continue
 
-            # Fallback handling agar API alag key se image bhej rahi ho
             thumbnail = (
                 batch.get("course_thumbnail") or 
                 batch.get("course_image") or 
@@ -129,15 +128,12 @@ def process_batch(token, userid, combined_data, seen_ids):
                 ""
             ).strip()
 
-            # STRICTLY ONLY 3 KEYS IN OUTPUT
-            filtered_batch = {
+            batches_found.append({
                 "id": b_id,
                 "course_name": course_name,
                 "course_thumbnail": thumbnail
-            }
-
-            combined_data.append(filtered_batch)
-            seen_ids.add(b_id)
+            })
+    return batches_found
 
 
 # ================= ENDPOINTS =================
@@ -148,19 +144,12 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
         raise HTTPException(status_code=400, detail="token and userid are required")
 
     identifier = phone.strip() if phone else userid.strip()
-
     try:
         redis.set(f"token:{identifier}", token.strip())
         redis.set(f"userid:{identifier}", userid.strip())
-        
         return {
             "status": "Success",
-            "message": f"Token saved successfully for {identifier}",
-            "data": {
-                "identifier": identifier,
-                "userid": userid,
-                "token_preview": token[:30] + "..." if len(token) > 30 else token
-            }
+            "message": f"Token saved successfully for {identifier}"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save token: {str(e)}")
@@ -168,31 +157,46 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
 
 @app.get("/api/my-batches")
 def get_all_merged_batches():
-    """Sirf Redis ke saved tokens se batches nikalega, KOI AUTOMATIC LOGIN NHI KAREGA"""
+    """PARALLEL FETCHING: Bina load liye sabhi saved tokens se batches ek sath nikalega"""
     combined_data = []
     seen_ids = set()
+    tasks = []
 
     try:
-        # Redis se saari tokens ki keys uthao
         all_keys = redis.keys("token:*")
         
+        # Pehle saare valid tokens aur userids nikal kar list bana lo
+        credentials = []
         for key in all_keys:
-            # Key format 'token:identifier' se identifier nikaalo
             identifier = key.split(":", 1)[1]
-            
             token = redis.get(f"token:{identifier}")
             userid = redis.get(f"userid:{identifier}")
-
-            # Agar token/userid dono hain tabhi check karega, koi perform_login() fallback nahi hoga!
             if token and userid:
-                process_batch(token, userid, combined_data, seen_ids)
+                credentials.append((token, userid))
+
+        # MULTI-THREADING (Saari API requests ek sath parallel chalengi ⚡)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_single_account_batches, t, u) for t, u in credentials]
+            for future in futures:
+                try:
+                    res = future.result()
+                    if res:
+                        tasks.extend(res)
+                except Exception as e:
+                    print(f"[ERROR] Thread execution failed: {e}")
+
+        # Duplicate handle karna aur clean response banana
+        for b in tasks:
+            if b["id"] not in seen_ids:
+                combined_data.append(b)
+                seen_ids.add(b["id"])
+
     except Exception as e:
-        print(f"[ERROR] Redis fetch or processing failed: {e}")
-        pass  # Graceful fallback khali list bhej dega agar redis down ho toh
+        print(f"[ERROR] Redis or processing failed: {e}")
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully (Strict Filtered)", 
+        "message": "All Batches Merged Successfully (Fast Parallel Mode)", 
         "data": combined_data
     }
 
@@ -237,20 +241,14 @@ def get_video_details(courseid: str, videoid: str):
 
 @app.post("/api/login")
 def sign_in_user(phone: str, password: str):
-    """Manual login for new accounts"""
     auth = perform_login(phone, password)
     if auth:
-        return {
-            "status": "Success", 
-            "message": "Logged in and Token Saved", 
-            "data": auth
-        }
+        return {"status": "Success", "message": "Logged in and Token Saved", "data": auth}
     raise HTTPException(status_code=401, detail="Login Failed")
 
 
 @app.get("/api/saved-tokens")
 def list_saved_tokens():
-    """List all saved tokens in Redis"""
     tokens = []
     try:
         keys = redis.keys("token:*")
@@ -261,7 +259,7 @@ def list_saved_tokens():
             tokens.append({
                 "identifier": ident,
                 "userid": userid,
-                "token_preview": token[:40] + "..." if token and len(token) > 40 else token
+                "token_preview": token[:20] + "..." if token else ""
             })
     except:
         pass
@@ -270,8 +268,4 @@ def list_saved_tokens():
 
 @app.get("/")
 def home():
-    return {
-        "status": "Active", 
-        "dev": "Maxx Papa", 
-        "msg": "Sachin Academy Aggregator API is running!"
-    }
+    return {"status": "Active", "dev": "Maxx Papa", "msg": "Sachin Academy Aggregator API is running!"}
