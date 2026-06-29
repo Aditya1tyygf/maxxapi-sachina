@@ -64,7 +64,7 @@ def perform_login(phone, password):
 
 
 def get_valid_auth():
-    """Pool mein se koi bhi ek valid auth nikaalne ke liye"""
+    """Pool mein se koi bhi ek valid auth nikaalne ke liye (for sub/topic endpoints)"""
     random.shuffle(ACCOUNTS)
     for acc in ACCOUNTS:
         token = redis.get(f"token:{acc['phone']}")
@@ -72,7 +72,7 @@ def get_valid_auth():
         if token and userid:
             return {"token": token, "userid": userid}
     
-    # Fallback login
+    # Fallback login sirf baaki endpoints ke liye agar Redis mein kuch na mile
     new_auth = perform_login(ACCOUNTS[0]["phone"], ACCOUNTS[0]["pass"])
     return new_auth
 
@@ -91,7 +91,6 @@ def fetch_api(path, params=None, auth_data=None):
     
     response = client.get(BASE_URL + path, headers=headers, params=params, timeout=15)
     
-    # Token expired
     if response.status_code in [401, 403]:
         return {"error": "reauth_needed"}
     
@@ -99,7 +98,7 @@ def fetch_api(path, params=None, auth_data=None):
 
 
 def process_batch(token, userid, combined_data, seen_ids):
-    """Helper function to process batches with old batch filtering"""
+    """Helper function to process batches and filter only 3 required keys"""
     result = fetch_api("/get/mycourseweb", {"userid": userid}, {"token": token, "userid": userid})
     
     if isinstance(result, dict) and result.get("status") == 200:
@@ -119,9 +118,25 @@ def process_batch(token, userid, combined_data, seen_ids):
                 course_name.lower() == "kvs interview batch old" or
                 ("old" in course_name.lower() and "kvs" in course_name.lower() and "interview" in course_name.lower())
             ):
-                continue  # Skip old KVS batch
+                continue
 
-            combined_data.append(batch)
+            # Fallback handling agar API alag key se image bhej rahi ho
+            thumbnail = (
+                batch.get("course_thumbnail") or 
+                batch.get("course_image") or 
+                batch.get("cover_image") or 
+                batch.get("thumbnail") or 
+                ""
+            ).strip()
+
+            # STRICTLY ONLY 3 KEYS IN OUTPUT
+            filtered_batch = {
+                "id": b_id,
+                "course_name": course_name,
+                "course_thumbnail": thumbnail
+            }
+
+            combined_data.append(filtered_batch)
             seen_ids.add(b_id)
 
 
@@ -153,45 +168,31 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
 
 @app.get("/api/my-batches")
 def get_all_merged_batches():
-    """Merge all batches from saved accounts + manual tokens (excluding old batches)"""
+    """Sirf Redis ke saved tokens se batches nikalega, KOI AUTOMATIC LOGIN NHI KAREGA"""
     combined_data = []
     seen_ids = set()
 
-    # 1. From ACCOUNTS list
-    for acc in ACCOUNTS:
-        phone = acc['phone']
-        token = redis.get(f"token:{phone}")
-        userid = redis.get(f"userid:{phone}")
-
-        if not token or not userid:
-            auth = perform_login(acc['phone'], acc['pass'])
-            if auth:
-                token, userid = auth["token"], auth["userid"]
-
-        if token and userid:
-            process_batch(token, userid, combined_data, seen_ids)
-
-    # 2. From manually added tokens
     try:
+        # Redis se saari tokens ki keys uthao
         all_keys = redis.keys("token:*")
+        
         for key in all_keys:
+            # Key format 'token:identifier' se identifier nikaalo
             identifier = key.split(":", 1)[1]
             
-            # Skip if already processed from ACCOUNTS
-            if any(acc['phone'] == identifier for acc in ACCOUNTS):
-                continue
-                
             token = redis.get(f"token:{identifier}")
             userid = redis.get(f"userid:{identifier}")
 
+            # Agar token/userid dono hain tabhi check karega, koi perform_login() fallback nahi hoga!
             if token and userid:
                 process_batch(token, userid, combined_data, seen_ids)
-    except:
-        pass  # graceful fallback
+    except Exception as e:
+        print(f"[ERROR] Redis fetch or processing failed: {e}")
+        pass  # Graceful fallback khali list bhej dega agar redis down ho toh
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully (Old batches excluded)", 
+        "message": "All Batches Merged Successfully (Strict Filtered)", 
         "data": combined_data
     }
 
@@ -273,4 +274,4 @@ def home():
         "status": "Active", 
         "dev": "Maxx Papa", 
         "msg": "Sachin Academy Aggregator API is running!"
-            }
+    }
