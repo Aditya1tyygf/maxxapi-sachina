@@ -1,5 +1,4 @@
 fastapi
 uvicorn
-requests
-upstash-redis
-python-multipart
+upstash_redis
+httpx
