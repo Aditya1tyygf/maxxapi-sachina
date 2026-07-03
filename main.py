@@ -5,7 +5,7 @@ from upstash_redis import Redis
 
 app = FastAPI(title="Sachin Academy Multi-Token Manager")
 
-# Upstash Redis Configuration (Sync initialization but fast cloud HTTP)
+# Upstash Redis Configuration
 UPSTASH_URL = "https://usable-dogfish-156605.upstash.io"
 UPSTASH_TOKEN = "gQAAAAAAAmO9AAIgcDFjY2Y5YWFiODk1ODg0NjJjOWMwZTJjMmRiZTJhMGUxMw"
 
@@ -32,7 +32,11 @@ def get_any_valid_token():
         all_keys = redis.keys("token:*")
         if not all_keys:
             raise HTTPException(status_code=404, detail="No tokens found in database")
-        return redis.get(all_keys[0])
+        # Redis se direct token fetch
+        token_val = redis.get(all_keys[0])
+        if not token_val:
+             raise HTTPException(status_code=404, detail="Token empty in storage")
+        return token_val
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
 
@@ -50,31 +54,40 @@ async def fetch_single_account_batches(client: httpx.AsyncClient, token: str, us
             return batches_found
             
         result = response.json()
-        if isinstance(result, dict) and str(result.get("status")) == "200":
+        
+        # FIX HERE: Response status string ya int kuch bhi ho, ya direct list ho toh accept karega
+        status_code = result.get("status") if isinstance(result, dict) else None
+        if isinstance(result, dict) and (status_code == 200 or str(status_code) == "200"):
             batch_list = result.get("data", [])
-            for batch in batch_list:
-                b_id = str(batch.get("id") or batch.get("course_id") or "")
-                course_name = batch.get("course_name", "").strip()
-                course_slug = batch.get("course_slug", "").strip()
+        elif isinstance(result, list):
+            batch_list = result
+        else:
+            batch_list = []
 
-                if not b_id or b_id in EXCLUDE_BATCHES or course_slug in EXCLUDE_BATCHES:
-                    continue
+        for batch in batch_list:
+            b_id = str(batch.get("id") or batch.get("course_id") or "")
+            course_name = batch.get("course_name") or batch.get("title") or batch.get("name") or ""
+            course_name = str(course_name).strip()
+            course_slug = str(batch.get("course_slug") or "").strip()
 
-                if "old" in course_name.lower() and "kvs" in course_name.lower() and "interview" in course_name.lower():
-                    continue
+            if not b_id or b_id in EXCLUDE_BATCHES or course_slug in EXCLUDE_BATCHES:
+                continue
 
-                thumbnail = (
-                    batch.get("course_thumbnail") or 
-                    batch.get("course_image") or 
-                    batch.get("cover_image") or 
-                    batch.get("thumbnail") or ""
-                ).strip()
+            if "old" in course_name.lower() and "kvs" in course_name.lower() and "interview" in course_name.lower():
+                continue
 
-                batches_found.append({
-                    "id": b_id,
-                    "course_name": course_name,
-                    "course_thumbnail": thumbnail
-                })
+            thumbnail = (
+                batch.get("course_thumbnail") or 
+                batch.get("course_image") or 
+                batch.get("cover_image") or 
+                batch.get("thumbnail") or ""
+            ).strip()
+
+            batches_found.append({
+                "id": b_id,
+                "course_name": course_name,
+                "course_thumbnail": thumbnail
+            })
     except Exception as e:
         print(f"[ERROR] Batch fetch failed: {e}")
         
@@ -107,6 +120,7 @@ async def get_all_merged_batches():
 
         identifiers = [key.split(":", 1)[1] for key in all_keys]
         
+        # Upstash-redis sync fetching inside async router block
         tokens = [redis.get(f"token:{ide}") for ide in identifiers]
         userids = [redis.get(f"userid:{ide}") for ide in identifiers]
 
