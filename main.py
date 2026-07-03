@@ -1,88 +1,51 @@
 import asyncio
+from fastapi import FastAPI, HTTPException, Query
 import httpx
-from fastapi import FastAPI, HTTPException
-import random
+from upstash_redis import Redis
 
-app = FastAPI(title="Sachin Academy Aggregator API (No Redis)")
+app = FastAPI(title="Sachin Academy Multi-Token Manager")
 
-# ================= CONFIGURATION =================
+# Upstash Redis Configuration
+UPSTASH_URL = "https://usable-dogfish-156605.upstash.io"
+UPSTASH_TOKEN = "gQAAAAAAAmO9AAIgcDFjY2Y5YWFiODk1ODg0NjJjOWMwZTJjMmRiZTJhMGUxMw"
 
-ACCOUNTS = [
-    {"phone": "9140256954", "pass": "Vikas@9651"},
-    {"phone": "9508063031", "pass": "Soni@95080"}
-]
+redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 BASE_URL = "https://sachinacademyapi.classx.co.in"
+EXCLUDE_BATCHES = ["demo", "test"] # Apne hisab se IDs ya slugs daal sakte ho
 
-COMMON_HEADERS = {
-    "Auth-Key": "appxapi",
-    "Client-Service": "Appx",
-    "Source": "website",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/146.0.0.0 Safari/537.36",
-    "Origin": "https://sachinacademy.classx.co.in",
-    "Referer": "https://sachinacademy.classx.co.in/"
-}
-
-EXCLUDE_BATCHES = {"8", "kvs-interview-batch-old"}
-
-# Reusable Async HTTP Client
-async_client = httpx.AsyncClient(timeout=10.0)
-
-# Server ki runtime memory me token to course map karne ke liye dictionary
-TOKEN_MAP = {}
-
-# ================= AUTH CORE =================
-
-async def perform_login(phone, password):
-    """Account login karke token aur userid nikalega"""
-    payload = {
-        "source": "website",
-        "phone": phone,
-        "email": phone,
-        "password": password,
-        "extra_details": "1"
+def get_headers(token: str):
+    return {
+        "Authorization": token,
+        "Auth-Key": "appxapi",
+        "Client-Service": "Appx",
+        "Source": "website",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+        "Origin": "https://sachinacademy.classx.co.in",
+        "Referer": "https://sachinacademy.classx.co.in/"
     }
-    try:
-        files = {k: (None, v) for k, v in payload.items()}
-        resp = await async_client.post(
-            f"{BASE_URL}/post/userLogin?extra_details=0", 
-            headers=COMMON_HEADERS, 
-            files=files, 
-            timeout=12.0
-        )
-        data = resp.json()
-        if resp.status_code == 200 and data.get("status") == 200:
-            return {
-                "token": data["data"]["token"], 
-                "userid": str(data["data"]["userid"])
-            }
-    except Exception as e:
-        print(f"[ERROR] Login failed for {phone}: {e}")
-    return None
 
+# Helper function to get any active/valid working token from Redis
+def get_any_valid_token():
+    all_keys = redis.keys("token:*")
+    if not all_keys:
+        raise HTTPException(status_code=404, detail="No tokens found in database")
+    # Sabse pehla token utha rahe hain generic requests (Subjects/Topics) ke liye
+    token = redis.get(all_keys[0])
+    return token
 
-async def fetch_single_account_batches(account):
-    """Pehle login karega fir us account ke saare batches nikalega"""
-    auth = await perform_login(account["phone"], account["pass"])
-    if not auth:
-        return []
-        
-    token = auth["token"]
-    userid = auth["userid"]
-    
-    headers = COMMON_HEADERS.copy()
-    headers.update({"Authorization": token, "User-Id": userid})
-    
+async def fetch_single_account_batches(client: httpx.AsyncClient, token: str, userid: str):
     batches_found = []
+    headers = get_headers(token)
     try:
-        response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
+        response = await client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid}, timeout=10)
         if response.status_code != 200:
             return batches_found
             
         result = response.json()
-        if isinstance(result, dict) and result.get("status") == 200:
+        if isinstance(result, dict) and str(result.get("status")) == "200":
             batch_list = result.get("data", [])
-            
             for batch in batch_list:
                 b_id = str(batch.get("id") or batch.get("course_id") or "")
                 course_name = batch.get("course_name", "").strip()
@@ -101,88 +64,104 @@ async def fetch_single_account_batches(account):
                     batch.get("thumbnail") or ""
                 ).strip()
 
-                # MEMORY MAPPING: Is course id ke liye kaunsa token valid hai, server memory me save kar lo
-                TOKEN_MAP[b_id] = {"token": token, "userid": userid}
-
                 batches_found.append({
                     "id": b_id,
                     "course_name": course_name,
                     "course_thumbnail": thumbnail
                 })
     except Exception as e:
-        print(f"[ERROR] Fetch batches failed for {account['phone']}: {e}")
+        print(f"[ERROR] Fetch single account failed: {e}")
         
     return batches_found
 
+---
 
-async def fetch_api(path, params, courseid):
-    """Course ID ke basis par runtime me sahi token pick karne ka wrapper"""
-    # Memory me check karo ki is course ka token hai ya nahi
-    auth = TOKEN_MAP.get(courseid)
-    
-    # Agar direct hit kiya hai bina /my-batches chalaye, toh pehle account se backup login kar lo
-    if not auth:
-        print(f"[INFO] Course {courseid} not mapped. Logging in to a random account as fallback.")
-        acc = random.choice(ACCOUNTS)
-        auth = await perform_login(acc["phone"], acc["pass"])
-        
-    if not auth:
-        raise HTTPException(status_code=401, detail="Authentication failed for accounts.")
+## 1. Token Save Endpoint (Upstash Redis)
+@app.get("/api/add-token")
+def add_manual_token(token: str, userid: str, phone: str = None):
+    if not token or not userid:
+        raise HTTPException(status_code=400, detail="token and userid are required")
 
-    headers = COMMON_HEADERS.copy()
-    headers.update({
-        "Authorization": auth["token"], 
-        "User-Id": auth["userid"]
-    })
-    
+    identifier = phone.strip() if phone else userid.strip()
     try:
-        response = await async_client.get(BASE_URL + path, headers=headers, params=params)
-        return response.json()
+        # Upstash-redis synchronous commands default use karta hai sync format mein
+        redis.set(f"token:{identifier}", token.strip())
+        redis.set(f"userid:{identifier}", userid.strip())
+        return {"status": "Success", "message": f"Token saved successfully for {identifier}"}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed to save token to Upstash: {str(e)}")
 
+---
 
-# ================= ENDPOINTS =================
-
+## 2. Merged Batches Endpoint
 @app.get("/api/my-batches")
 async def get_all_merged_batches():
-    """Dono accounts se batches parallel fetch karke merge karega"""
     combined_data = []
     seen_ids = set()
 
-    # Dono accounts par ek sath parallel login aur fetch chalega fast execution ke liye ⚡
-    tasks = [fetch_single_account_batches(acc) for acc in ACCOUNTS]
-    results = await asyncio.gather(*tasks)
+    try:
+        all_keys = redis.keys("token:*")
+        if not all_keys:
+            return {"status": 200, "message": "No tokens found", "data": []}
 
-    for batch_list in results:
-        for b in batch_list:
-            if b["id"] not in seen_ids:
-                combined_data.append(b)
-                seen_ids.add(b["id"])
+        identifiers = [key.split(":", 1)[1] for key in all_keys]
+        
+        # Gathering credentials from Upstash
+        tokens = [redis.get(f"token:{ide}") for ide in identifiers]
+        userids = [redis.get(f"userid:{ide}") for ide in identifiers]
+
+        async with httpx.AsyncClient() as client:
+            api_tasks = []
+            for t, u in zip(tokens, userids):
+                if t and u:
+                    api_tasks.append(fetch_single_account_batches(client, t, u))
+
+            results = await asyncio.gather(*api_tasks)
+
+        for batch_list in results:
+            for b in batch_list:
+                if b["id"] not in seen_ids:
+                    combined_data.append(b)
+                    seen_ids.add(b["id"])
+
+    except Exception as e:
+        print(f"[ERROR] Upstash or async processing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully from ACCOUNTS", 
+        "message": "All Batches Merged Successfully (Ultra Fast Async Mode)", 
         "data": combined_data
     }
 
+---
+
+## 3. Separate Clean Endpoints for Hierarchy
 
 @app.get("/api/subjects")
 async def get_subjects(courseid: str):
-    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, courseid=courseid)
-
+    token = get_any_valid_token()
+    headers = get_headers(token)
+    
+    async with httpx.AsyncClient() as client:
+        res = await client.get(f"{BASE_URL}/get/allsubjectfrmlivecourseclass", headers=headers, params={"courseid": courseid, "start": "-1"})
+        return res.json()
 
 @app.get("/api/topics")
 async def get_topics(courseid: str, subjectid: str):
-    return await fetch_api("/get/alltopicfrmlivecourseclass", {
-        "courseid": courseid, 
-        "subjectid": subjectid, 
-        "start": "-1"
-    }, courseid=courseid)
-
+    token = get_any_valid_token()
+    headers = get_headers(token)
+    
+    params = {"courseid": courseid, "subjectid": subjectid, "start": "-1"}
+    async with httpx.AsyncClient() as client:
+        res = await client.get(f"{BASE_URL}/get/alltopicfrmlivecourseclass", headers=headers, params=params)
+        return res.json()
 
 @app.get("/api/videos")
 async def get_videos(courseid: str, subjectid: str, topicid: str):
+    token = get_any_valid_token()
+    headers = get_headers(token)
+    
     params = {
         "courseid": courseid,
         "subjectid": subjectid,
@@ -191,20 +170,26 @@ async def get_videos(courseid: str, subjectid: str, topicid: str):
         "windowsapp": "false",
         "start": "0"
     }
-    return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params, courseid=courseid)
-
+    async with httpx.AsyncClient() as client:
+        res = await client.get(f"{BASE_URL}/get/livecourseclassbycoursesubtopconceptapiv3", headers=headers, params=params)
+        return res.json()
 
 @app.get("/api/video-details")
 async def get_video_details(courseid: str, videoid: str):
+    token = get_any_valid_token()
+    headers = get_headers(token)
+    
     params = {
         "course_id": courseid, 
         "video_id": videoid, 
         "ytflag": "0", 
-        "folder_wise_course": "0"
+        "folder_wise_course": "0",
+        "lc_app_api_url": ""
     }
-    return await fetch_api("/get/fetchVideoDetailsById", params, courseid=courseid)
+    async with httpx.AsyncClient() as client:
+        res = await client.get(f"{BASE_URL}/get/fetchVideoDetailsById", headers=headers, params=params)
+        return res.json()
 
-
-@app.get("/")
-def home():
-    return {"status": "Active", "msg": "Sachin Academy Local Multi-Account Aggregator is running smoothly!"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
