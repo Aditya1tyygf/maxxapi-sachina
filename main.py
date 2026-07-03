@@ -31,13 +31,12 @@ COMMON_HEADERS = {
 
 EXCLUDE_BATCHES = {"8", "kvs-interview-batch-old"}
 
-# Reusable Async HTTP Client to reduce connection handshake overhead
+# Reusable Async HTTP Client
 async_client = httpx.AsyncClient(timeout=10.0)
 
-# ================= AUTH CORE (ASYNC WITH AUTO-RETRY) =================
+# ================= AUTH CORE (AUTOMATED MAPPING) =================
 
 async def perform_login(phone, password):
-    """Fresh token nikal kar Redis mein save karega"""
     payload = {
         "source": "website",
         "phone": phone,
@@ -58,30 +57,37 @@ async def perform_login(phone, password):
             token = data["data"]["token"]
             userid = str(data["data"]["userid"])
             
-            # Redis mein data override kar dega instantly
             await asyncio.gather(
                 redis.set(f"token:{phone}", token),
                 redis.set(f"userid:{phone}", userid)
             )
-            print(f"[SUCCESS] Re-logged in successfully for {phone}")
             return {"token": token, "userid": userid}
     except Exception as e:
-        print(f"[ERROR] Auto-Login failed for {phone}: {e}")
+        print(f"[ERROR] Login failed for {phone}: {e}")
     return None
 
 
-async def get_valid_auth(force_refresh=False):
-    """Tokens uthayega, agar force_refresh milta hai toh direct re-login karega"""
+async def get_valid_auth(courseid=None, force_refresh=False):
+    """
+    Pehle check karega ki is courseid ka sahi token mapped hai ya nahi.
+    Agar courseid nahi hai ya map nahi mila, toh pool se backup token dega.
+    """
+    if courseid and not force_refresh:
+        # Redis se is specific course ka owner token aur userid nikalenge
+        mapped_token = await redis.get(f"course_token:{courseid}")
+        mapped_userid = await redis.get(f"course_userid:{courseid}")
+        if mapped_token and mapped_userid:
+            return {"token": mapped_token, "userid": mapped_userid}
+
+    # Fallback/Backup logic agar mapping nahi mili ya expire ho gayi
     random.shuffle(ACCOUNTS)
+    for acc in ACCOUNTS:
+        token = await redis.get(f"token:{acc['phone']}")
+        userid = await redis.get(f"userid:{acc['phone']}")
+        if token and userid:
+            return {"token": token, "userid": userid}
     
-    if not force_refresh:
-        for acc in ACCOUNTS:
-            token = await redis.get(f"token:{acc['phone']}")
-            userid = await redis.get(f"userid:{acc['phone']}")
-            if token and userid:
-                return {"token": token, "userid": userid}
-    
-    # Agar force refresh ho ya token khali ho, fresh login chalega
+    # Bilkul hi kuch nahi mila toh fresh login
     for acc in ACCOUNTS:
         new_auth = await perform_login(acc["phone"], acc["pass"])
         if new_auth:
@@ -89,11 +95,11 @@ async def get_valid_auth(force_refresh=False):
     return None
 
 
-async def fetch_api(path, params=None, auth_data=None, retry_count=0):
-    """Sabhi data endpoints ke liye smart dynamic fetching engine aur retry logic"""
-    auth = auth_data if auth_data else await get_valid_auth()
+async def fetch_api(path, params=None, courseid=None, retry_count=0):
+    """Automated Routing Engine: Sahi token Redis se auto-pick karega"""
+    auth = await get_valid_auth(courseid=courseid)
     if not auth:
-        raise HTTPException(status_code=401, detail="Authentication failed for all accounts.")
+        raise HTTPException(status_code=401, detail="Authentication failed.")
 
     headers = COMMON_HEADERS.copy()
     headers.update({
@@ -104,14 +110,13 @@ async def fetch_api(path, params=None, auth_data=None, retry_count=0):
     try:
         response = await async_client.get(BASE_URL + path, headers=headers, params=params)
         
-        # Agar status code token issue batata hai ya response text unauthorized bolta hai
         if response.status_code in [401, 403] or (response.status_code == 200 and "unauthorized" in response.text.lower()):
-            if retry_count < 1:  # Sirf ek baar retry lagayenge taaki infinite loop na bane
-                print(f"[REAUTH_TRIGGERED] Token validation failed on {path}. Fetching new credentials...")
-                fresh_auth = await get_valid_auth(force_refresh=True)
-                if fresh_auth:
-                    return await fetch_api(path, params, auth_data=fresh_auth, retry_count=retry_count+1)
-            return {"error": "reauth_needed_even_after_retry"}
+            if retry_count < 1:
+                print(f"[REAUTH] Token expired for course {courseid}. Refreshing static accounts...")
+                # Global account refresh mark karo aur retry karo
+                await get_valid_auth(courseid=courseid, force_refresh=True)
+                return await fetch_api(path, params, courseid=courseid, retry_count=retry_count+1)
+            return {"error": "reauth_needed"}
             
         return response.json()
     except Exception as e:
@@ -119,7 +124,6 @@ async def fetch_api(path, params=None, auth_data=None, retry_count=0):
 
 
 async def fetch_single_account_batches(token, userid):
-    """Async API call for Single Account Batches"""
     headers = COMMON_HEADERS.copy()
     headers.update({"Authorization": token, "User-Id": userid})
     
@@ -132,6 +136,8 @@ async def fetch_single_account_batches(token, userid):
         result = response.json()
         if isinstance(result, dict) and result.get("status") == 200:
             batch_list = result.get("data", [])
+            
+            redis_tasks = []
             for batch in batch_list:
                 b_id = str(batch.get("id") or batch.get("course_id") or "")
                 course_name = batch.get("course_name", "").strip()
@@ -150,11 +156,20 @@ async def fetch_single_account_batches(token, userid):
                     batch.get("thumbnail") or ""
                 ).strip()
 
+                # AUTOMATION MAGIC: Har course_id ke aage uska sahi token/userid map karke save kar rahe hain Redis me
+                redis_tasks.append(redis.set(f"course_token:{b_id}", token))
+                redis_tasks.append(redis.set(f"course_userid:{b_id}", userid))
+
                 batches_found.append({
                     "id": b_id,
                     "course_name": course_name,
                     "course_thumbnail": thumbnail
                 })
+            
+            # Saari mapping ek sath async background me Redis me push kar di
+            if redis_tasks:
+                await asyncio.gather(*redis_tasks)
+
     except Exception as e:
         print(f"[ERROR] Fetch single account failed: {e}")
         
@@ -215,14 +230,15 @@ async def get_all_merged_batches():
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully (Ultra Fast Async Mode)", 
+        "message": "All Batches Merged Successfully (With Auto-Token Mapping)", 
         "data": combined_data
     }
 
 
 @app.get("/api/subjects")
 async def get_subjects(courseid: str):
-    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid})
+    # Pass courseid taaki sahi token lookup ho sake automatic
+    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, courseid=courseid)
 
 
 @app.get("/api/topics")
@@ -231,7 +247,7 @@ async def get_topics(courseid: str, subjectid: str):
         "courseid": courseid, 
         "subjectid": subjectid, 
         "start": "-1"
-    })
+    }, courseid=courseid)
 
 
 @app.get("/api/videos")
@@ -244,7 +260,7 @@ async def get_videos(courseid: str, subjectid: str, topicid: str):
         "windowsapp": "false",
         "start": "0"
     }
-    return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params)
+    return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params, courseid=courseid)
 
 
 @app.get("/api/video-details")
@@ -255,7 +271,7 @@ async def get_video_details(courseid: str, videoid: str):
         "ytflag": "0", 
         "folder_wise_course": "0"
     }
-    return await fetch_api("/get/fetchVideoDetailsById", params)
+    return await fetch_api("/get/fetchVideoDetailsById", params, courseid=courseid)
 
 
 @app.post("/api/login")
@@ -292,4 +308,4 @@ async def list_saved_tokens():
 
 @app.get("/")
 def home():
-    return {"status": "Active", "dev": "Maxx Papa", "msg": "Sachin Academy Aggregator API is running smoothly!"}
+    return {"status": "Active", "dev": "Maxx Papa", "msg": "Sachin Academy Dynamic Token Mapper Running Smoothly!"}
