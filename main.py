@@ -11,7 +11,6 @@ app = FastAPI(title="Sachin Academy Final Aggregator API")
 REDIS_URL = "https://winning-lioness-97755.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAX3bAAIgcDExMDY4NGY2OWZlZGY0OWY0ODA0NmNmZDNlM2JhNGUxOA"
 
-# Async Redis connection initialize kiya
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 
 ACCOUNTS = [
@@ -33,11 +32,12 @@ COMMON_HEADERS = {
 EXCLUDE_BATCHES = {"8", "kvs-interview-batch-old"}
 
 # Reusable Async HTTP Client to reduce connection handshake overhead
-async_client = httpx.AsyncClient(timeout=8.0)
+async_client = httpx.AsyncClient(timeout=10.0)
 
-# ================= AUTH CORE (ASYNC) =================
+# ================= AUTH CORE (ASYNC WITH AUTO-RETRY) =================
 
 async def perform_login(phone, password):
+    """Fresh token nikal kar Redis mein save karega"""
     payload = {
         "source": "website",
         "phone": phone,
@@ -46,43 +46,51 @@ async def perform_login(phone, password):
         "extra_details": "1"
     }
     try:
-        # httpx me files ki jagah data/form use hota hai multipart ke liye
         files = {k: (None, v) for k, v in payload.items()}
         resp = await async_client.post(
             f"{BASE_URL}/post/userLogin?extra_details=0", 
             headers=COMMON_HEADERS, 
             files=files, 
-            timeout=10.0
+            timeout=12.0
         )
         data = resp.json()
         if resp.status_code == 200 and data.get("status") == 200:
             token = data["data"]["token"]
             userid = str(data["data"]["userid"])
             
-            # Async Redis Set
+            # Redis mein data override kar dega instantly
             await asyncio.gather(
                 redis.set(f"token:{phone}", token),
                 redis.set(f"userid:{phone}", userid)
             )
-            return {"token": token, "userid": userid, "phone": phone}
+            print(f"[SUCCESS] Re-logged in successfully for {phone}")
+            return {"token": token, "userid": userid}
     except Exception as e:
-        print(f"[ERROR] Login failed for {phone}: {e}")
+        print(f"[ERROR] Auto-Login failed for {phone}: {e}")
     return None
 
 
-async def get_valid_auth():
+async def get_valid_auth(force_refresh=False):
+    """Tokens uthayega, agar force_refresh milta hai toh direct re-login karega"""
     random.shuffle(ACCOUNTS)
-    for acc in ACCOUNTS:
-        token = await redis.get(f"token:{acc['phone']}")
-        userid = await redis.get(f"userid:{acc['phone']}")
-        if token and userid:
-            return {"token": token, "userid": userid}
     
-    new_auth = await perform_login(ACCOUNTS[0]["phone"], ACCOUNTS[0]["pass"])
-    return new_auth
+    if not force_refresh:
+        for acc in ACCOUNTS:
+            token = await redis.get(f"token:{acc['phone']}")
+            userid = await redis.get(f"userid:{acc['phone']}")
+            if token and userid:
+                return {"token": token, "userid": userid}
+    
+    # Agar force refresh ho ya token khali ho, fresh login chalega
+    for acc in ACCOUNTS:
+        new_auth = await perform_login(acc["phone"], acc["pass"])
+        if new_auth:
+            return new_auth
+    return None
 
 
-async def fetch_api(path, params=None, auth_data=None):
+async def fetch_api(path, params=None, auth_data=None, retry_count=0):
+    """Sabhi data endpoints ke liye smart dynamic fetching engine aur retry logic"""
     auth = auth_data if auth_data else await get_valid_auth()
     if not auth:
         raise HTTPException(status_code=401, detail="Authentication failed for all accounts.")
@@ -95,8 +103,16 @@ async def fetch_api(path, params=None, auth_data=None):
     
     try:
         response = await async_client.get(BASE_URL + path, headers=headers, params=params)
-        if response.status_code in [401, 403]:
-            return {"error": "reauth_needed"}
+        
+        # Agar status code token issue batata hai ya response text unauthorized bolta hai
+        if response.status_code in [401, 403] or (response.status_code == 200 and "unauthorized" in response.text.lower()):
+            if retry_count < 1:  # Sirf ek baar retry lagayenge taaki infinite loop na bane
+                print(f"[REAUTH_TRIGGERED] Token validation failed on {path}. Fetching new credentials...")
+                fresh_auth = await get_valid_auth(force_refresh=True)
+                if fresh_auth:
+                    return await fetch_api(path, params, auth_data=fresh_auth, retry_count=retry_count+1)
+            return {"error": "reauth_needed_even_after_retry"}
+            
         return response.json()
     except Exception as e:
         return {"error": str(e)}
@@ -165,7 +181,6 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
 
 @app.get("/api/my-batches")
 async def get_all_merged_batches():
-    """SUPER FAST ASYNC FETCH: Ek baar me saare batches fast parallel process honge"""
     combined_data = []
     seen_ids = set()
 
@@ -174,23 +189,19 @@ async def get_all_merged_batches():
         if not all_keys:
             return {"status": 200, "message": "No tokens found", "data": []}
 
-        # Pipeline technique / Async Gather to fetch all Redis keys instantly
         identifiers = [key.split(":", 1)[1] for key in all_keys]
         
         token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
         userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
         
-        # Ek hi jhatke me saare tokens aur userids Redis se utha liye
         tokens = await asyncio.gather(*token_tasks)
         userids = await asyncio.gather(*userid_tasks)
 
-        # Build execution tasks for third-party API
         api_tasks = []
         for t, u in zip(tokens, userids):
             if t and u:
                 api_tasks.append(fetch_single_account_batches(t, u))
 
-        # Saare accounts ke batches ek saath parallel fetch ho rhe hain bina block hue ⚡
         results = await asyncio.gather(*api_tasks)
 
         for batch_list in results:
