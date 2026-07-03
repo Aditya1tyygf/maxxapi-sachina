@@ -1,18 +1,18 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 import httpx
 from upstash_redis import Redis
 
 app = FastAPI(title="Sachin Academy Multi-Token Manager")
 
-# Upstash Redis Configuration
+# Upstash Redis Configuration (Sync initialization but fast cloud HTTP)
 UPSTASH_URL = "https://usable-dogfish-156605.upstash.io"
 UPSTASH_TOKEN = "gQAAAAAAAmO9AAIgcDFjY2Y5YWFiODk1ODg0NjJjOWMwZTJjMmRiZTJhMGUxMw"
 
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 BASE_URL = "https://sachinacademyapi.classx.co.in"
-EXCLUDE_BATCHES = ["demo", "test"] # Apne hisab se IDs ya slugs daal sakte ho
+EXCLUDE_BATCHES = ["demo", "test"]
 
 def get_headers(token: str):
     return {
@@ -26,20 +26,26 @@ def get_headers(token: str):
         "Referer": "https://sachinacademy.classx.co.in/"
     }
 
-# Helper function to get any active/valid working token from Redis
 def get_any_valid_token():
-    all_keys = redis.keys("token:*")
-    if not all_keys:
-        raise HTTPException(status_code=404, detail="No tokens found in database")
-    # Sabse pehla token utha rahe hain generic requests (Subjects/Topics) ke liye
-    token = redis.get(all_keys[0])
-    return token
+    """Helper to pick a token safely for other requests"""
+    try:
+        all_keys = redis.keys("token:*")
+        if not all_keys:
+            raise HTTPException(status_code=404, detail="No tokens found in database")
+        return redis.get(all_keys[0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
 
 async def fetch_single_account_batches(client: httpx.AsyncClient, token: str, userid: str):
     batches_found = []
     headers = get_headers(token)
     try:
-        response = await client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid}, timeout=10)
+        response = await client.get(
+            f"{BASE_URL}/get/mycourseweb", 
+            headers=headers, 
+            params={"userid": userid}, 
+            timeout=10
+        )
         if response.status_code != 200:
             return batches_found
             
@@ -70,13 +76,12 @@ async def fetch_single_account_batches(client: httpx.AsyncClient, token: str, us
                     "course_thumbnail": thumbnail
                 })
     except Exception as e:
-        print(f"[ERROR] Fetch single account failed: {e}")
+        print(f"[ERROR] Batch fetch failed: {e}")
         
     return batches_found
 
----
+# --- ENDPOINTS ---
 
-## 1. Token Save Endpoint (Upstash Redis)
 @app.get("/api/add-token")
 def add_manual_token(token: str, userid: str, phone: str = None):
     if not token or not userid:
@@ -84,16 +89,12 @@ def add_manual_token(token: str, userid: str, phone: str = None):
 
     identifier = phone.strip() if phone else userid.strip()
     try:
-        # Upstash-redis synchronous commands default use karta hai sync format mein
         redis.set(f"token:{identifier}", token.strip())
         redis.set(f"userid:{identifier}", userid.strip())
-        return {"status": "Success", "message": f"Token saved successfully for {identifier}"}
+        return {"status": "Success", "message": f"Token saved for {identifier}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save token to Upstash: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upstash error: {str(e)}")
 
----
-
-## 2. Merged Batches Endpoint
 @app.get("/api/my-batches")
 async def get_all_merged_batches():
     combined_data = []
@@ -106,7 +107,6 @@ async def get_all_merged_batches():
 
         identifiers = [key.split(":", 1)[1] for key in all_keys]
         
-        # Gathering credentials from Upstash
         tokens = [redis.get(f"token:{ide}") for ide in identifiers]
         userids = [redis.get(f"userid:{ide}") for ide in identifiers]
 
@@ -125,24 +125,18 @@ async def get_all_merged_batches():
                     seen_ids.add(b["id"])
 
     except Exception as e:
-        print(f"[ERROR] Upstash or async processing failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Merged batches error: {str(e)}")
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully (Ultra Fast Async Mode)", 
+        "message": "All Batches Merged Successfully", 
         "data": combined_data
     }
-
----
-
-## 3. Separate Clean Endpoints for Hierarchy
 
 @app.get("/api/subjects")
 async def get_subjects(courseid: str):
     token = get_any_valid_token()
     headers = get_headers(token)
-    
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{BASE_URL}/get/allsubjectfrmlivecourseclass", headers=headers, params={"courseid": courseid, "start": "-1"})
         return res.json()
@@ -151,7 +145,6 @@ async def get_subjects(courseid: str):
 async def get_topics(courseid: str, subjectid: str):
     token = get_any_valid_token()
     headers = get_headers(token)
-    
     params = {"courseid": courseid, "subjectid": subjectid, "start": "-1"}
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{BASE_URL}/get/alltopicfrmlivecourseclass", headers=headers, params=params)
@@ -161,7 +154,6 @@ async def get_topics(courseid: str, subjectid: str):
 async def get_videos(courseid: str, subjectid: str, topicid: str):
     token = get_any_valid_token()
     headers = get_headers(token)
-    
     params = {
         "courseid": courseid,
         "subjectid": subjectid,
@@ -178,7 +170,6 @@ async def get_videos(courseid: str, subjectid: str, topicid: str):
 async def get_video_details(courseid: str, videoid: str):
     token = get_any_valid_token()
     headers = get_headers(token)
-    
     params = {
         "course_id": courseid, 
         "video_id": videoid, 
@@ -189,7 +180,3 @@ async def get_video_details(courseid: str, videoid: str):
     async with httpx.AsyncClient() as client:
         res = await client.get(f"{BASE_URL}/get/fetchVideoDetailsById", headers=headers, params=params)
         return res.json()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
