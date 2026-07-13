@@ -23,27 +23,39 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
-# Dynamic Headers helper to pass token & userid
-def get_auth_headers(token: str, userid: str):
-    headers = COMMON_HEADERS.copy()
-    headers.update({
-        "Authorization": token.strip(),
-        "User-Id": userid.strip()
-    })
-    return headers
+# Helper to automatically get token and userid from a Course ID
+async def get_auth_by_course(courseid: str):
+    loop = asyncio.get_event_loop()
+    # Redis se mapped token aur userid fetch karega
+    auth_data = await loop.run_in_executor(None, redis_client.hgetall, f"courseid:{courseid}")
+    if not auth_data or "token" not in auth_data or "userid" not in auth_data:
+        raise HTTPException(status_code=401, detail=f"No valid token found for courseid: {courseid}. Please refresh /api/my-batches first.")
+    return auth_data["token"], auth_data["userid"]
 
-async def fetch_api(endpoint: str, params: dict, token: str, userid: str):
+async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
-        headers = get_auth_headers(token, userid)
+        # Course ID ke basis par Redis se automatic token nikal rahe hain
+        token, userid = await get_auth_by_course(courseid)
+        
+        headers = COMMON_HEADERS.copy()
+        headers.update({
+            "Authorization": token,
+            "User-Id": userid
+        })
+        
         response = await async_client.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
         return response.json()
+    except HTTPException as he:
+        return {"status": he.status_code, "msg": he.detail}
     except Exception as e:
         return {"status": 500, "message": f"API Error: {str(e)}", "data": []}
 
 # ================= CORE LOGIC =================
 
 async def fetch_single_account_batches(token, userid, identifier):
-    headers = get_auth_headers(token, userid)
+    headers = COMMON_HEADERS.copy()
+    headers.update({"Authorization": token, "User-Id": userid})
+    
     batches_found = []
     try:
         response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
@@ -52,6 +64,10 @@ async def fetch_single_account_batches(token, userid, identifier):
             result = response.json()
             if isinstance(result, dict) and result.get("status") == 200:
                 batch_list = result.get("data", [])
+                
+                loop = asyncio.get_event_loop()
+                redis_mapping_tasks = []
+                
                 for batch in batch_list:
                     b_id = str(batch.get("id") or batch.get("course_id") or "")
                     course_name = batch.get("course_name", "").strip()
@@ -75,6 +91,18 @@ async def fetch_single_account_batches(token, userid, identifier):
                         "course_name": course_name,
                         "course_thumbnail": thumbnail
                     })
+                    
+                    # YAHAN MAPPING SAVE HO RAHI HAI: Har batch id ke liye token aur userid map ho raha hai (24 hours expiry ke sath)
+                    redis_mapping_tasks.append(
+                        loop.run_in_executor(None, redis_client.hset, f"courseid:{b_id}", mapping={"token": token, "userid": userid})
+                    )
+                    redis_mapping_tasks.append(
+                        loop.run_in_executor(None, redis_client.expire, f"courseid:{b_id}", 86400) # 24 Hours expiry
+                    )
+                
+                if redis_mapping_tasks:
+                    await asyncio.gather(*redis_mapping_tasks)
+                    
     except Exception as e:
         print(f"[ERROR] Fetch single account failed for {identifier}: {e}")
     
@@ -149,39 +177,36 @@ async def get_all_merged_batches():
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully", 
+        "message": "All Batches Merged and Mapped Successfully", 
         "data": combined_data
     }
 
-# --- Yahan se endpoints fix kiye hain (Ab token aur userid pass karna hoga frontend se) ---
+# --- Ab inme token bhejne ki jarurat nahi hai, backend courseid se khud nikal lega ---
 
 @app.get("/api/subjects")
-async def get_subjects(courseid: str, token: str, userid: str):
-    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, token, userid)
+async def get_subjects(courseid: str):
+    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, courseid)
 
 @app.get("/api/topics")
-async def get_topics(courseid: str, subjectid: str, token: str, userid: str):
+async def get_topics(courseid: str, subjectid: str):
     return await fetch_api(
         "/get/alltopicfrmlivecourseclass", 
         {"courseid": courseid, "subjectid": subjectid, "start": "-1"}, 
-        token, 
-        userid
+        courseid
     )
 
 @app.get("/api/videos")
-async def get_videos(courseid: str, subjectid: str, topicid: str, token: str, userid: str):
+async def get_videos(courseid: str, subjectid: str, topicid: str):
     return await fetch_api(
         "/get/livecourseclassbycoursesubtopconceptapiv3", 
         {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "", "windowsapp": "false", "start": "0"}, 
-        token, 
-        userid
+        courseid
     )
 
 @app.get("/api/video-details")
-async def get_video_details(courseid: str, videoid: str, token: str, userid: str):
+async def get_video_details(courseid: str, videoid: str):
     return await fetch_api(
         "/get/fetchVideoDetailsById", 
         {"course_id": courseid, "video_id": videoid, "ytflag": "0", "folder_wise_course": "0"}, 
-        token, 
-        userid
+        courseid
     )
