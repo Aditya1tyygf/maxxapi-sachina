@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
 import httpx
-from upstash_redis import Redis  # Vercel serverless ke liye best
+from upstash_redis import Redis
 
 app = FastAPI()
 
@@ -10,10 +10,7 @@ REDIS_URL = "https://winning-lioness-97755.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAX3bAAIgcDExMDY4NGY2OWZlZGY0OWY0ODA0NmNmZDNlM2JhNGUxOA"
 BASE_URL = "https://sachinacademyapi.classx.co.in"
 
-# Upstash Redis HTTP Client (No TCP/SSL socket errors on Vercel)
 redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-
-# HTTP Client (Vercel me async_client ko function ke andar manage karna safe hota hai)
 async_client = httpx.AsyncClient()
 EXCLUDE_BATCHES = set()
 
@@ -26,9 +23,19 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
-async def fetch_api(endpoint: str, params: dict):
+# Dynamic Headers helper to pass token & userid
+def get_auth_headers(token: str, userid: str):
+    headers = COMMON_HEADERS.copy()
+    headers.update({
+        "Authorization": token.strip(),
+        "User-Id": userid.strip()
+    })
+    return headers
+
+async def fetch_api(endpoint: str, params: dict, token: str, userid: str):
     try:
-        response = await async_client.get(f"{BASE_URL}{endpoint}", headers=COMMON_HEADERS, params=params)
+        headers = get_auth_headers(token, userid)
+        response = await async_client.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
         return response.json()
     except Exception as e:
         return {"status": 500, "message": f"API Error: {str(e)}", "data": []}
@@ -36,13 +43,7 @@ async def fetch_api(endpoint: str, params: dict):
 # ================= CORE LOGIC =================
 
 async def fetch_single_account_batches(token, userid, identifier):
-    """
-    Batches fetch karega, agar nahi mile toh serverless-safe tarike se
-    Redis se data delete kar dega.
-    """
-    headers = COMMON_HEADERS.copy()
-    headers.update({"Authorization": token, "User-Id": userid})
-    
+    headers = get_auth_headers(token, userid)
     batches_found = []
     try:
         response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
@@ -77,11 +78,9 @@ async def fetch_single_account_batches(token, userid, identifier):
     except Exception as e:
         print(f"[ERROR] Fetch single account failed for {identifier}: {e}")
     
-    # BATCHES NAHI MILE TOH REDIS SE TOKEN DELETE
     if not batches_found:
         print(f"[CLEANUP] No batches found for {identifier}. Deleting keys...")
         try:
-            # Sync calls ko loop.run_in_executor me chalana serverless me thik rehta hai
             loop = asyncio.get_event_loop()
             await asyncio.gather(
                 loop.run_in_executor(None, redis_client.delete, f"token:{identifier}"),
@@ -119,7 +118,6 @@ async def get_all_merged_batches():
 
     try:
         loop = asyncio.get_event_loop()
-        # Fetch all keys using Upstash HTTP Client
         all_keys = await loop.run_in_executor(None, redis_client.keys, "token:*")
         
         if not all_keys:
@@ -127,7 +125,6 @@ async def get_all_merged_batches():
 
         identifiers = [key.split(":", 1)[1] for key in all_keys]
         
-        # Gathering Redis HTTP Requests efficiently
         token_tasks = [loop.run_in_executor(None, redis_client.get, f"token:{ide}") for ide in identifiers]
         userid_tasks = [loop.run_in_executor(None, redis_client.get, f"userid:{ide}") for ide in identifiers]
         
@@ -156,20 +153,35 @@ async def get_all_merged_batches():
         "data": combined_data
     }
 
+# --- Yahan se endpoints fix kiye hain (Ab token aur userid pass karna hoga frontend se) ---
+
 @app.get("/api/subjects")
-async def get_subjects(courseid: str):
-    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid})
+async def get_subjects(courseid: str, token: str, userid: str):
+    return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, token, userid)
 
 @app.get("/api/topics")
-async def get_topics(courseid: str, subjectid: str):
-    return await fetch_api("/get/alltopicfrmlivecourseclass", {"courseid": courseid, "subjectid": subjectid, "start": "-1"})
+async def get_topics(courseid: str, subjectid: str, token: str, userid: str):
+    return await fetch_api(
+        "/get/alltopicfrmlivecourseclass", 
+        {"courseid": courseid, "subjectid": subjectid, "start": "-1"}, 
+        token, 
+        userid
+    )
 
 @app.get("/api/videos")
-async def get_videos(courseid: str, subjectid: str, topicid: str):
-    return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", {
-        "courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "", "windowsapp": "false", "start": "0"
-    })
+async def get_videos(courseid: str, subjectid: str, topicid: str, token: str, userid: str):
+    return await fetch_api(
+        "/get/livecourseclassbycoursesubtopconceptapiv3", 
+        {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "", "windowsapp": "false", "start": "0"}, 
+        token, 
+        userid
+    )
 
 @app.get("/api/video-details")
-async def get_video_details(courseid: str, videoid: str):
-    return await fetch_api("/get/fetchVideoDetailsById", {"course_id": courseid, "video_id": videoid, "ytflag": "0", "folder_wise_course": "0"})
+async def get_video_details(courseid: str, videoid: str, token: str, userid: str):
+    return await fetch_api(
+        "/get/fetchVideoDetailsById", 
+        {"course_id": courseid, "video_id": videoid, "ytflag": "0", "folder_wise_course": "0"}, 
+        token, 
+        userid
+    )
