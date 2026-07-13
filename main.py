@@ -23,7 +23,7 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
-# Dynamic dynamic mapping check karega courseid ke respect me
+# Dynamic mapping check karega courseid ke respect me
 async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
         mapped_token = await redis.get(f"course_token:{courseid}")
@@ -197,3 +197,26 @@ async def get_video_details(courseid: str, videoid: str):
         "folder_wise_course": "0"
     }
     return await fetch_api("/get/fetchVideoDetailsById", params, courseid)
+
+
+# --- Naye endpoints jo aapne bataye ---
+
+@app.get("/api/live-upcoming")
+async def get_live_upcoming_courses(courseid: str):
+    """Upcoming live classes fetch karne ke liye"""
+    params = {
+        "courseid": courseid,
+        "start": "-1"
+    }
+    return await fetch_api("/get/live_upcoming_course_classv2", params, courseid)
+
+
+@app.get("/api/previous-live-videos")
+async def get_previous_live_videos(courseid: str):
+    """Pichli live videos records lane ke liye"""
+    params = {
+        "course_id": courseid,
+        "start": "0",
+        "folder_wise_course": "0"
+    }
+    return await fetch_api("/get/get_previous_live_videos", params, courseid)
