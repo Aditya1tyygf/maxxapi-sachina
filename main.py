@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
 import httpx
-from upstash_redis import Redis
+from upstash_redis.asyncio import Redis  # Serverless safe client
 
 app = FastAPI()
 
@@ -10,7 +10,7 @@ REDIS_URL = "https://winning-lioness-97755.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAX3bAAIgcDExMDY4NGY2OWZlZGY0OWY0ODA0NmNmZDNlM2JhNGUxOA"
 BASE_URL = "https://sachinacademyapi.classx.co.in"
 
-redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 async_client = httpx.AsyncClient()
 EXCLUDE_BATCHES = set()
 
@@ -23,51 +23,39 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
-# Helper to automatically get token and userid from a Course ID
-async def get_auth_by_course(courseid: str):
-    loop = asyncio.get_event_loop()
-    # Redis se mapped token aur userid fetch karega
-    auth_data = await loop.run_in_executor(None, redis_client.hgetall, f"courseid:{courseid}")
-    if not auth_data or "token" not in auth_data or "userid" not in auth_data:
-        raise HTTPException(status_code=401, detail=f"No valid token found for courseid: {courseid}. Please refresh /api/my-batches first.")
-    return auth_data["token"], auth_data["userid"]
-
+# Dynamic dynamic mapping check karega courseid ke respect me
 async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
-        # Course ID ke basis par Redis se automatic token nikal rahe hain
-        token, userid = await get_auth_by_course(courseid)
+        mapped_token = await redis.get(f"course_token:{courseid}")
+        mapped_userid = await redis.get(f"course_userid:{courseid}")
         
+        if not mapped_token or not mapped_userid:
+            return {"status": 401, "msg": "No mapping found for this course. Hit /api/my-batches first."}
+            
         headers = COMMON_HEADERS.copy()
-        headers.update({
-            "Authorization": token,
-            "User-Id": userid
-        })
+        headers.update({"Authorization": mapped_token, "User-Id": mapped_userid})
         
         response = await async_client.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
         return response.json()
-    except HTTPException as he:
-        return {"status": he.status_code, "msg": he.detail}
     except Exception as e:
         return {"status": 500, "message": f"API Error: {str(e)}", "data": []}
 
 # ================= CORE LOGIC =================
 
 async def fetch_single_account_batches(token, userid, identifier):
+    """Async API call for Single Account Batches + Auto Mapping & Cleanup"""
     headers = COMMON_HEADERS.copy()
     headers.update({"Authorization": token, "User-Id": userid})
     
     batches_found = []
     try:
         response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
-        
         if response.status_code == 200:
             result = response.json()
             if isinstance(result, dict) and result.get("status") == 200:
                 batch_list = result.get("data", [])
                 
-                loop = asyncio.get_event_loop()
-                redis_mapping_tasks = []
-                
+                redis_tasks = []
                 for batch in batch_list:
                     b_id = str(batch.get("id") or batch.get("course_id") or "")
                     course_name = batch.get("course_name", "").strip()
@@ -92,31 +80,25 @@ async def fetch_single_account_batches(token, userid, identifier):
                         "course_thumbnail": thumbnail
                     })
                     
-                    # YAHAN MAPPING SAVE HO RAHI HAI: Har batch id ke liye token aur userid map ho raha hai (24 hours expiry ke sath)
-                    redis_mapping_tasks.append(
-                        loop.run_in_executor(None, redis_client.hset, f"courseid:{b_id}", mapping={"token": token, "userid": userid})
-                    )
-                    redis_mapping_tasks.append(
-                        loop.run_in_executor(None, redis_client.expire, f"courseid:{b_id}", 86400) # 24 Hours expiry
-                    )
+                    # Token ko uske courseid se map kar rahe hain taaki subject automatic chal sake
+                    redis_tasks.append(redis.set(f"course_token:{b_id}", token))
+                    redis_tasks.append(redis.set(f"course_userid:{b_id}", userid))
+                    redis_tasks.append(redis.expire(f"course_token:{b_id}", 86400)) # 24 Hours expiry
+                    redis_tasks.append(redis.expire(f"course_userid:{b_id}", 86400))
                 
-                if redis_mapping_tasks:
-                    await asyncio.gather(*redis_mapping_tasks)
-                    
+                if redis_tasks:
+                    await asyncio.gather(*redis_tasks)
     except Exception as e:
-        print(f"[ERROR] Fetch single account failed for {identifier}: {e}")
-    
+        print(f"[ERROR] Fetch single account failed: {e}")
+        
+    # Agar is token se batches nahi mile, toh token delete kar do
     if not batches_found:
-        print(f"[CLEANUP] No batches found for {identifier}. Deleting keys...")
-        try:
-            loop = asyncio.get_event_loop()
-            await asyncio.gather(
-                loop.run_in_executor(None, redis_client.delete, f"token:{identifier}"),
-                loop.run_in_executor(None, redis_client.delete, f"userid:{identifier}")
-            )
-        except Exception as re:
-            print(f"[ERROR] Redis cleanup failed for {identifier}: {re}")
-            
+        print(f"[CLEANUP] Deleting useless token for {identifier}")
+        await asyncio.gather(
+            redis.delete(f"token:{identifier}"),
+            redis.delete(f"userid:{identifier}")
+        )
+        
     return batches_found
 
 
@@ -129,10 +111,9 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
 
     identifier = phone.strip() if phone else userid.strip()
     try:
-        loop = asyncio.get_event_loop()
         await asyncio.gather(
-            loop.run_in_executor(None, redis_client.set, f"token:{identifier}", token.strip()),
-            loop.run_in_executor(None, redis_client.set, f"userid:{identifier}", userid.strip())
+            redis.set(f"token:{identifier}", token.strip()),
+            redis.set(f"userid:{identifier}", userid.strip())
         )
         return {"status": "Success", "message": f"Token saved successfully for {identifier}"}
     except Exception as e:
@@ -145,16 +126,14 @@ async def get_all_merged_batches():
     seen_ids = set()
 
     try:
-        loop = asyncio.get_event_loop()
-        all_keys = await loop.run_in_executor(None, redis_client.keys, "token:*")
-        
+        all_keys = await redis.keys("token:*")
         if not all_keys:
             return {"status": 200, "message": "No tokens found", "data": []}
 
         identifiers = [key.split(":", 1)[1] for key in all_keys]
         
-        token_tasks = [loop.run_in_executor(None, redis_client.get, f"token:{ide}") for ide in identifiers]
-        userid_tasks = [loop.run_in_executor(None, redis_client.get, f"userid:{ide}") for ide in identifiers]
+        token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
+        userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
         
         tokens = await asyncio.gather(*token_tasks)
         userids = await asyncio.gather(*userid_tasks)
@@ -173,40 +152,48 @@ async def get_all_merged_batches():
                     seen_ids.add(b["id"])
 
     except Exception as e:
-        print(f"[ERROR] Redis processing failed: {e}")
+        print(f"[ERROR] Redis or async processing failed: {e}")
 
     return {
         "status": 200, 
-        "message": "All Batches Merged and Mapped Successfully", 
+        "message": "All Batches Merged Successfully (Ultra Fast Async Mode)", 
         "data": combined_data
     }
 
-# --- Ab inme token bhejne ki jarurat nahi hai, backend courseid se khud nikal lega ---
 
 @app.get("/api/subjects")
 async def get_subjects(courseid: str):
     return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, courseid)
 
+
 @app.get("/api/topics")
 async def get_topics(courseid: str, subjectid: str):
-    return await fetch_api(
-        "/get/alltopicfrmlivecourseclass", 
-        {"courseid": courseid, "subjectid": subjectid, "start": "-1"}, 
-        courseid
-    )
+    return await fetch_api("/get/alltopicfrmlivecourseclass", {
+        "courseid": courseid, 
+        "subjectid": subjectid, 
+        "start": "-1"
+    }, courseid)
+
 
 @app.get("/api/videos")
 async def get_videos(courseid: str, subjectid: str, topicid: str):
-    return await fetch_api(
-        "/get/livecourseclassbycoursesubtopconceptapiv3", 
-        {"courseid": courseid, "subjectid": subjectid, "topicid": topicid, "conceptid": "", "windowsapp": "false", "start": "0"}, 
-        courseid
-    )
+    params = {
+        "courseid": courseid,
+        "subjectid": subjectid,
+        "topicid": topicid,
+        "conceptid": "",
+        "windowsapp": "false",
+        "start": "0"
+    }
+    return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params, courseid)
+
 
 @app.get("/api/video-details")
 async def get_video_details(courseid: str, videoid: str):
-    return await fetch_api(
-        "/get/fetchVideoDetailsById", 
-        {"course_id": courseid, "video_id": videoid, "ytflag": "0", "folder_wise_course": "0"}, 
-        courseid
-    )
+    params = {
+        "course_id": courseid, 
+        "video_id": videoid, 
+        "ytflag": "0", 
+        "folder_wise_course": "0"
+    }
+    return await fetch_api("/get/fetchVideoDetailsById", params, courseid)
