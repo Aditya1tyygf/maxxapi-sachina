@@ -43,7 +43,7 @@ async def fetch_api(endpoint: str, params: dict, courseid: str):
 # ================= CORE LOGIC =================
 
 async def fetch_single_account_batches(token, userid, identifier):
-    """Async API call for Single Account Batches + Auto Mapping & Cleanup"""
+    """Async API call for Single Account Batches + Auto Mapping (No Cleanup)"""
     headers = COMMON_HEADERS.copy()
     headers.update({"Authorization": token, "User-Id": userid})
     
@@ -91,13 +91,8 @@ async def fetch_single_account_batches(token, userid, identifier):
     except Exception as e:
         print(f"[ERROR] Fetch single account failed: {e}")
         
-    # Agar is token se batches nahi mile, toh token delete kar do
-    if not batches_found:
-        print(f"[CLEANUP] Deleting useless token for {identifier}")
-        await asyncio.gather(
-            redis.delete(f"token:{identifier}"),
-            redis.delete(f"userid:{identifier}")
-        )
+    # --- YAHAN SE DELETE/CLEANUP LOGIC PURA HATA DIYA HAI ---
+    # batches_found khali hone par bhi token ab delete nahi hoga.
         
     return batches_found
 
@@ -199,7 +194,7 @@ async def get_video_details(courseid: str, videoid: str):
     return await fetch_api("/get/fetchVideoDetailsById", params, courseid)
 
 
-# --- Naye endpoints jo aapne bataye ---
+# --- Naye endpoints ---
 
 @app.get("/api/live-upcoming")
 async def get_live_upcoming_courses(courseid: str):
