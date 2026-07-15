@@ -29,6 +29,12 @@ async def fetch_api(endpoint: str, params: dict, courseid: str):
         mapped_token = await redis.get(f"course_token:{courseid}")
         mapped_userid = await redis.get(f"course_userid:{courseid}")
         
+        # Safe string decoding
+        if isinstance(mapped_token, bytes):
+            mapped_token = mapped_token.decode("utf-8")
+        if isinstance(mapped_userid, bytes):
+            mapped_userid = mapped_userid.decode("utf-8")
+        
         if not mapped_token or not mapped_userid:
             return {"status": 401, "msg": "No mapping found for this course. Hit /api/my-batches first."}
             
@@ -40,20 +46,29 @@ async def fetch_api(endpoint: str, params: dict, courseid: str):
     except Exception as e:
         return {"status": 500, "message": f"API Error: {str(e)}", "data": []}
 
+
 # ================= CORE LOGIC =================
 
 async def fetch_single_account_batches(token, userid, identifier):
-    """Async API call for Single Account Batches + Auto Mapping (No Cleanup)"""
+    """Async API call for Single Account Batches + Auto Mapping"""
     headers = COMMON_HEADERS.copy()
     headers.update({"Authorization": token, "User-Id": userid})
     
     batches_found = []
     try:
         response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
+        print(f"[DEBUG - {identifier}] HTTP Status: {response.status_code}")
+        
         if response.status_code == 200:
             result = response.json()
-            if isinstance(result, dict) and result.get("status") == 200:
+            print(f"[DEBUG - {identifier}] API Response JSON: {result}")
+            
+            status_code = result.get("status")
+            # Integer 200 aur String "200" dono ko check karega
+            if isinstance(result, dict) and (status_code == 200 or str(status_code) == "200"):
                 batch_list = result.get("data", [])
+                if not batch_list:
+                    batch_list = []
                 
                 redis_tasks = []
                 for batch in batch_list:
@@ -80,7 +95,7 @@ async def fetch_single_account_batches(token, userid, identifier):
                         "course_thumbnail": thumbnail
                     })
                     
-                    # Token ko uske courseid se map kar rahe hain taaki subject automatic chal sake
+                    # Token mapping for fast lookups
                     redis_tasks.append(redis.set(f"course_token:{b_id}", token))
                     redis_tasks.append(redis.set(f"course_userid:{b_id}", userid))
                     redis_tasks.append(redis.expire(f"course_token:{b_id}", 86400)) # 24 Hours expiry
@@ -88,16 +103,67 @@ async def fetch_single_account_batches(token, userid, identifier):
                 
                 if redis_tasks:
                     await asyncio.gather(*redis_tasks)
+            else:
+                print(f"[DEBUG - {identifier}] Unexpected status in JSON: {status_code}")
+        else:
+            print(f"[ERROR - {identifier}] Non-200 API Response: {response.text}")
+            
     except Exception as e:
-        print(f"[ERROR] Fetch single account failed: {e}")
-        
-    # --- YAHAN SE DELETE/CLEANUP LOGIC PURA HATA DIYA HAI ---
-    # batches_found khali hone par bhi token ab delete nahi hoga.
+        print(f"[ERROR - {identifier}] Fetch single account failed: {e}")
         
     return batches_found
 
 
 # ================= ENDPOINTS =================
+
+# --- NEW ENDPOINT: Redis ke sare tokens check karne ke liye ---
+@app.get("/api/all-tokens")
+async def get_all_tokens_in_redis():
+    """Redis mein stored sabhi active tokens aur details show karne ke liye"""
+    try:
+        all_keys = await redis.keys("token:*")
+        if not all_keys:
+            return {
+                "status": "Success",
+                "total_tokens": 0,
+                "message": "No tokens found in database",
+                "tokens": []
+            }
+
+        # Safe key decode & preparation
+        identifiers = []
+        for key in all_keys:
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            if ":" in key:
+                identifiers.append(key.split(":", 1)[1])
+
+        token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
+        userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
+        
+        tokens = await asyncio.gather(*token_tasks)
+        userids = await asyncio.gather(*userid_tasks)
+
+        saved_tokens = []
+        for ide, t, u in zip(identifiers, tokens, userids):
+            # Safe bytes decoding for values
+            decoded_t = t.decode("utf-8") if isinstance(t, bytes) else t
+            decoded_u = u.decode("utf-8") if isinstance(u, bytes) else u
+            
+            saved_tokens.append({
+                "identifier": ide,
+                "token": decoded_t,
+                "userid": decoded_u
+            })
+
+        return {
+            "status": "Success",
+            "total_tokens": len(saved_tokens),
+            "tokens": saved_tokens
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch tokens from Redis: {str(e)}")
+
 
 @app.get("/api/add-token")
 async def add_manual_token(token: str, userid: str, phone: str = None):
@@ -122,10 +188,18 @@ async def get_all_merged_batches():
 
     try:
         all_keys = await redis.keys("token:*")
+        print(f"[DEBUG - my-batches] Raw keys from Redis: {all_keys}")
+        
         if not all_keys:
-            return {"status": 200, "message": "No tokens found", "data": []}
+            return {"status": 200, "message": "No tokens found in DB", "data": []}
 
-        identifiers = [key.split(":", 1)[1] for key in all_keys]
+        # Safe string processing for Redis Keys
+        identifiers = []
+        for key in all_keys:
+            if isinstance(key, bytes):
+                key = key.decode("utf-8")
+            if ":" in key:
+                identifiers.append(key.split(":", 1)[1])
         
         token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
         userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
@@ -135,8 +209,12 @@ async def get_all_merged_batches():
 
         api_tasks = []
         for ide, t, u in zip(identifiers, tokens, userids):
-            if t and u:
-                api_tasks.append(fetch_single_account_batches(t, u, ide))
+            # Decode values if they are bytes
+            decoded_t = t.decode("utf-8") if isinstance(t, bytes) else t
+            decoded_u = u.decode("utf-8") if isinstance(u, bytes) else u
+            
+            if decoded_t and decoded_u:
+                api_tasks.append(fetch_single_account_batches(decoded_t, decoded_u, ide))
 
         results = await asyncio.gather(*api_tasks)
 
@@ -147,7 +225,7 @@ async def get_all_merged_batches():
                     seen_ids.add(b["id"])
 
     except Exception as e:
-        print(f"[ERROR] Redis or async processing failed: {e}")
+        print(f"[ERROR] Redis or async processing failed in /my-batches: {e}")
 
     return {
         "status": 200, 
@@ -194,11 +272,10 @@ async def get_video_details(courseid: str, videoid: str):
     return await fetch_api("/get/fetchVideoDetailsById", params, courseid)
 
 
-# --- Naye endpoints ---
+# --- Live Stream Endpoints ---
 
 @app.get("/api/live-upcoming")
 async def get_live_upcoming_courses(courseid: str):
-    """Upcoming live classes fetch karne ke liye"""
     params = {
         "courseid": courseid,
         "start": "-1"
@@ -208,7 +285,6 @@ async def get_live_upcoming_courses(courseid: str):
 
 @app.get("/api/previous-live-videos")
 async def get_previous_live_videos(courseid: str):
-    """Pichli live videos records lane ke liye"""
     params = {
         "course_id": courseid,
         "start": "0",
