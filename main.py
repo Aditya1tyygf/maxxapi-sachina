@@ -1,15 +1,26 @@
 import asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 import httpx
-from upstash_redis.asyncio import Redis  # Serverless safe client
+from upstash_redis.asyncio import Redis
 
 app = FastAPI()
 
 # ================= CONFIGURATION =================
-# Naye Credentials Yahan Update Kar Diye Hain:
+# Active Upstash Credentials
 REDIS_URL = "https://amusing-humpback-162221.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAnmtAAIgcDI2MGMxOTI5M2QzZDU0MGRhOWMwYmIzNzI4NzMwYWVhNQ"
 BASE_URL = "https://sachinacademyapi.classx.co.in"
+
+# 🔒 SECURITY KEY (Headers mein X-API-Key ke sath ye value bhejna)
+API_KEY = "Maxxkoogfchahiye@123" 
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+
+async def get_api_key(api_key: str = Security(api_key_header)):
+    if api_key == API_KEY:
+        return api_key
+    raise HTTPException(status_code=403, detail="Could not validate credentials - Unauthorized")
 
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 async_client = httpx.AsyncClient()
@@ -65,11 +76,8 @@ async def fetch_single_account_batches(token, userid, identifier):
             print(f"[DEBUG - {identifier}] API Response JSON: {result}")
             
             status_code = result.get("status")
-            # Integer 200 aur String "200" dono ko check karega
             if isinstance(result, dict) and (status_code == 200 or str(status_code) == "200"):
-                batch_list = result.get("data", [])
-                if not batch_list:
-                    batch_list = []
+                batch_list = result.get("data", []) or []
                 
                 redis_tasks = []
                 for batch in batch_list:
@@ -99,7 +107,7 @@ async def fetch_single_account_batches(token, userid, identifier):
                     # Token mapping for fast lookups
                     redis_tasks.append(redis.set(f"course_token:{b_id}", token))
                     redis_tasks.append(redis.set(f"course_userid:{b_id}", userid))
-                    redis_tasks.append(redis.expire(f"course_token:{b_id}", 86400)) # 24 Hours expiry
+                    redis_tasks.append(redis.expire(f"course_token:{b_id}", 86400))
                     redis_tasks.append(redis.expire(f"course_userid:{b_id}", 86400))
                 
                 if redis_tasks:
@@ -117,55 +125,23 @@ async def fetch_single_account_batches(token, userid, identifier):
 
 # ================= ENDPOINTS =================
 
-@app.get("/api/all-tokens")
+# 🔒 SUPER SECURE ALL-TOKENS ENDPOINT: Ab identifiers bhi nahi dikhenge!
+@app.get("/api/all-tokens", dependencies=[Depends(get_api_key)])
 async def get_all_tokens_in_redis():
-    """Redis mein stored sabhi active tokens aur details show karne ke liye"""
+    """Redis mein stored total active tokens ka sirf numeric count batayega (100% Safe)"""
     try:
         all_keys = await redis.keys("token:*")
-        if not all_keys:
-            return {
-                "status": "Success",
-                "total_tokens": 0,
-                "message": "No tokens found in database",
-                "tokens": []
-            }
-
-        # Safe key decode & preparation
-        identifiers = []
-        for key in all_keys:
-            if isinstance(key, bytes):
-                key = key.decode("utf-8")
-            if ":" in key:
-                identifiers.append(key.split(":", 1)[1])
-
-        token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
-        userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
+        total_count = len(all_keys) if all_keys else 0
         
-        tokens = await asyncio.gather(*token_tasks)
-        userids = await asyncio.gather(*userid_tasks)
-
-        saved_tokens = []
-        for ide, t, u in zip(identifiers, tokens, userids):
-            # Safe bytes decoding for values
-            decoded_t = t.decode("utf-8") if isinstance(t, bytes) else t
-            decoded_u = u.decode("utf-8") if isinstance(u, bytes) else u
-            
-            saved_tokens.append({
-                "identifier": ide,
-                "token": decoded_t,
-                "userid": decoded_u
-            })
-
         return {
             "status": "Success",
-            "total_tokens": len(saved_tokens),
-            "tokens": saved_tokens
+            "total_tokens_count": total_count
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch tokens from Redis: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch token count from Redis: {str(e)}")
 
 
-@app.get("/api/add-token")
+@app.get("/api/add-token", dependencies=[Depends(get_api_key)])
 async def add_manual_token(token: str, userid: str, phone: str = None):
     if not token or not userid:
         raise HTTPException(status_code=400, detail="token and userid are required")
@@ -181,7 +157,7 @@ async def add_manual_token(token: str, userid: str, phone: str = None):
         raise HTTPException(status_code=500, detail=f"Failed to save token: {str(e)}")
 
 
-@app.get("/api/my-batches")
+@app.get("/api/my-batches", dependencies=[Depends(get_api_key)])
 async def get_all_merged_batches():
     combined_data = []
     seen_ids = set()
@@ -193,7 +169,6 @@ async def get_all_merged_batches():
         if not all_keys:
             return {"status": 200, "message": "No tokens found in DB", "data": []}
 
-        # Safe string processing for Redis Keys
         identifiers = []
         for key in all_keys:
             if isinstance(key, bytes):
@@ -209,7 +184,6 @@ async def get_all_merged_batches():
 
         api_tasks = []
         for ide, t, u in zip(identifiers, tokens, userids):
-            # Decode values if they are bytes
             decoded_t = t.decode("utf-8") if isinstance(t, bytes) else t
             decoded_u = u.decode("utf-8") if isinstance(u, bytes) else u
             
@@ -234,12 +208,12 @@ async def get_all_merged_batches():
     }
 
 
-@app.get("/api/subjects")
+@app.get("/api/subjects", dependencies=[Depends(get_api_key)])
 async def get_subjects(courseid: str):
     return await fetch_api("/get/allsubjectfrmlivecourseclass", {"courseid": courseid}, courseid)
 
 
-@app.get("/api/topics")
+@app.get("/api/topics", dependencies=[Depends(get_api_key)])
 async def get_topics(courseid: str, subjectid: str):
     return await fetch_api("/get/alltopicfrmlivecourseclass", {
         "courseid": courseid, 
@@ -248,7 +222,7 @@ async def get_topics(courseid: str, subjectid: str):
     }, courseid)
 
 
-@app.get("/api/videos")
+@app.get("/api/videos", dependencies=[Depends(get_api_key)])
 async def get_videos(courseid: str, subjectid: str, topicid: str):
     params = {
         "courseid": courseid,
@@ -261,7 +235,7 @@ async def get_videos(courseid: str, subjectid: str, topicid: str):
     return await fetch_api("/get/livecourseclassbycoursesubtopconceptapiv3", params, courseid)
 
 
-@app.get("/api/video-details")
+@app.get("/api/video-details", dependencies=[Depends(get_api_key)])
 async def get_video_details(courseid: str, videoid: str):
     params = {
         "course_id": courseid, 
@@ -274,7 +248,7 @@ async def get_video_details(courseid: str, videoid: str):
 
 # --- Live Stream Endpoints ---
 
-@app.get("/api/live-upcoming")
+@app.get("/api/live-upcoming", dependencies=[Depends(get_api_key)])
 async def get_live_upcoming_courses(courseid: str):
     params = {
         "courseid": courseid,
@@ -283,7 +257,7 @@ async def get_live_upcoming_courses(courseid: str):
     return await fetch_api("/get/live_upcoming_course_classv2", params, courseid)
 
 
-@app.get("/api/previous-live-videos")
+@app.get("/api/previous-live-videos", dependencies=[Depends(get_api_key)])
 async def get_previous_live_videos(courseid: str):
     params = {
         "course_id": courseid,
