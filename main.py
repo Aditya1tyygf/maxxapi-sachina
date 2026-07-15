@@ -6,8 +6,9 @@ from upstash_redis.asyncio import Redis  # Serverless safe client
 app = FastAPI()
 
 # ================= CONFIGURATION =================
-REDIS_URL = "https://winning-lioness-97755.upstash.io"
-REDIS_TOKEN = "gQAAAAAAAX3bAAIgcDExMDY4NGY2OWZlZGY0OWY0ODA0NmNmZDNlM2JhNGUxOA"
+# Naye Credentials Yahan Update Kar Diye Hain:
+REDIS_URL = "https://amusing-humpback-162221.upstash.io"
+REDIS_TOKEN = "gQAAAAAAAnmtAAIgcDI2MGMxOTI5M2QzZDU0MGRhOWMwYmIzNzI4NzMwYWVhNQ"
 BASE_URL = "https://sachinacademyapi.classx.co.in"
 
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
@@ -116,7 +117,6 @@ async def fetch_single_account_batches(token, userid, identifier):
 
 # ================= ENDPOINTS =================
 
-# --- NEW ENDPOINT: Redis ke sare tokens check karne ke liye ---
 @app.get("/api/all-tokens")
 async def get_all_tokens_in_redis():
     """Redis mein stored sabhi active tokens aur details show karne ke liye"""
