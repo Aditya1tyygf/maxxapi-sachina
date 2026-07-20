@@ -6,13 +6,12 @@ from upstash_redis.asyncio import Redis
 app = FastAPI()
 
 # ================= CONFIGURATION =================
-# Active Upstash Credentials
 REDIS_URL = "https://amusing-humpback-162221.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAnmtAAIgcDI2MGMxOTI5M2QzZDU0MGRhOWMwYmIzNzI4NzMwYWVhNQ"
 BASE_URL = "https://sachinacademyapi.classx.co.in"
 
 redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-async_client = httpx.AsyncClient()
+async_client = httpx.AsyncClient(timeout=15.0)  # Added 15s timeout for stability
 EXCLUDE_BATCHES = set()
 
 COMMON_HEADERS = {
@@ -24,17 +23,19 @@ COMMON_HEADERS = {
     "Referer": "https://sachinacademy.classx.co.in/"
 }
 
-# Dynamic mapping check karega courseid ke respect me
+# ================= HELPER FUNCTIONS =================
+
+def safe_decode(val):
+    if isinstance(val, bytes):
+        return val.decode("utf-8").strip()
+    if isinstance(val, str):
+        return val.strip()
+    return ""
+
 async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
-        mapped_token = await redis.get(f"course_token:{courseid}")
-        mapped_userid = await redis.get(f"course_userid:{courseid}")
-        
-        # Safe string decoding
-        if isinstance(mapped_token, bytes):
-            mapped_token = mapped_token.decode("utf-8")
-        if isinstance(mapped_userid, bytes):
-            mapped_userid = mapped_userid.decode("utf-8")
+        mapped_token = safe_decode(await redis.get(f"course_token:{courseid}"))
+        mapped_userid = safe_decode(await redis.get(f"course_userid:{courseid}"))
         
         if not mapped_token or not mapped_userid:
             return {"status": 401, "msg": "No mapping found for this course. Hit /api/my-batches first."}
@@ -50,7 +51,7 @@ async def fetch_api(endpoint: str, params: dict, courseid: str):
 
 # ================= CORE LOGIC =================
 
-async def fetch_single_account_batches(token, userid, identifier):
+async def fetch_single_account_batches(token: str, userid: str, identifier: str):
     """Async API call for Single Account Batches + Auto Mapping"""
     headers = COMMON_HEADERS.copy()
     headers.update({"Authorization": token, "User-Id": userid})
@@ -58,21 +59,19 @@ async def fetch_single_account_batches(token, userid, identifier):
     batches_found = []
     try:
         response = await async_client.get(f"{BASE_URL}/get/mycourseweb", headers=headers, params={"userid": userid})
-        print(f"[DEBUG - {identifier}] HTTP Status: {response.status_code}")
         
         if response.status_code == 200:
             result = response.json()
-            print(f"[DEBUG - {identifier}] API Response JSON: {result}")
-            
             status_code = result.get("status")
+            
             if isinstance(result, dict) and (status_code == 200 or str(status_code) == "200"):
                 batch_list = result.get("data", []) or []
                 
                 redis_tasks = []
                 for batch in batch_list:
-                    b_id = str(batch.get("id") or batch.get("course_id") or "")
-                    course_name = batch.get("course_name", "").strip()
-                    course_slug = batch.get("course_slug", "").strip()
+                    b_id = str(batch.get("id") or batch.get("course_id") or "").strip()
+                    course_name = str(batch.get("course_name", "")).strip()
+                    course_slug = str(batch.get("course_slug", "")).strip()
 
                     if not b_id or b_id in EXCLUDE_BATCHES or course_slug in EXCLUDE_BATCHES:
                         continue
@@ -93,7 +92,7 @@ async def fetch_single_account_batches(token, userid, identifier):
                         "course_thumbnail": thumbnail
                     })
                     
-                    # Token mapping for fast lookups
+                    # Store mapping in Redis (Valid for 24 hours)
                     redis_tasks.append(redis.set(f"course_token:{b_id}", token))
                     redis_tasks.append(redis.set(f"course_userid:{b_id}", userid))
                     redis_tasks.append(redis.expire(f"course_token:{b_id}", 86400))
@@ -102,12 +101,12 @@ async def fetch_single_account_batches(token, userid, identifier):
                 if redis_tasks:
                     await asyncio.gather(*redis_tasks)
             else:
-                print(f"[DEBUG - {identifier}] Unexpected status in JSON: {status_code}")
+                print(f"[DEBUG - {identifier}] ClassX Returned non-200 inside JSON: {status_code}")
         else:
-            print(f"[ERROR - {identifier}] Non-200 API Response: {response.text}")
+            print(f"[ERROR - {identifier}] HTTP Error: {response.status_code} - {response.text}")
             
     except Exception as e:
-        print(f"[ERROR - {identifier}] Fetch single account failed: {e}")
+        print(f"[ERROR - {identifier}] Fetch failed: {str(e)}")
         
     return batches_found
 
@@ -116,11 +115,9 @@ async def fetch_single_account_batches(token, userid, identifier):
 
 @app.get("/api/all-tokens")
 async def get_all_tokens_in_redis():
-    """Redis mein stored total active tokens ka sirf numeric count batayega (100% Safe)"""
     try:
         all_keys = await redis.keys("token:*")
         total_count = len(all_keys) if all_keys else 0
-        
         return {
             "status": "Success",
             "total_tokens_count": total_count
@@ -152,17 +149,14 @@ async def get_all_merged_batches():
 
     try:
         all_keys = await redis.keys("token:*")
-        print(f"[DEBUG - my-batches] Raw keys from Redis: {all_keys}")
-        
         if not all_keys:
             return {"status": 200, "message": "No tokens found in DB", "data": []}
 
         identifiers = []
         for key in all_keys:
-            if isinstance(key, bytes):
-                key = key.decode("utf-8")
-            if ":" in key:
-                identifiers.append(key.split(":", 1)[1])
+            decoded_key = safe_decode(key)
+            if ":" in decoded_key:
+                identifiers.append(decoded_key.split(":", 1)[1])
         
         token_tasks = [redis.get(f"token:{ide}") for ide in identifiers]
         userid_tasks = [redis.get(f"userid:{ide}") for ide in identifiers]
@@ -171,27 +165,37 @@ async def get_all_merged_batches():
         userids = await asyncio.gather(*userid_tasks)
 
         api_tasks = []
+        processed_accounts = 0
+
         for ide, t, u in zip(identifiers, tokens, userids):
-            decoded_t = t.decode("utf-8") if isinstance(t, bytes) else t
-            decoded_u = u.decode("utf-8") if isinstance(u, bytes) else u
-            
+            decoded_t = safe_decode(t)
+            decoded_u = safe_decode(u) or ide  # Fallback: Agar UserID missing hai toh Identifier ko UserID maano
+
             if decoded_t and decoded_u:
+                processed_accounts += 1
                 api_tasks.append(fetch_single_account_batches(decoded_t, decoded_u, ide))
+
+        if not api_tasks:
+            return {
+                "status": 400, 
+                "message": f"Found {len(identifiers)} token keys, but failed to extract valid tokens/userids.", 
+                "data": []
+            }
 
         results = await asyncio.gather(*api_tasks)
 
         for batch_list in results:
             for b in batch_list:
-                if b["id"] not in seen_ids:
+                if b.get("id") and b["id"] not in seen_ids:
                     combined_data.append(b)
                     seen_ids.add(b["id"])
 
     except Exception as e:
-        print(f"[ERROR] Redis or async processing failed in /my-batches: {e}")
+        return {"status": 500, "message": f"Internal Error: {str(e)}", "data": []}
 
     return {
         "status": 200, 
-        "message": "All Batches Merged Successfully (Ultra Fast Async Mode)", 
+        "message": f"Fetched {len(combined_data)} unique batches from {processed_accounts} active accounts.", 
         "data": combined_data
     }
 
@@ -233,8 +237,6 @@ async def get_video_details(courseid: str, videoid: str):
     }
     return await fetch_api("/get/fetchVideoDetailsById", params, courseid)
 
-
-# --- Live Stream Endpoints ---
 
 @app.get("/api/live-upcoming")
 async def get_live_upcoming_courses(courseid: str):
