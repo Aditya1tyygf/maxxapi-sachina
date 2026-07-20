@@ -31,20 +31,39 @@ COMMON_HEADERS = {
 # ================= HELPER FUNCTIONS =================
 
 def load_user_tokens():
-    """Local JSON file se tokens load karne ka function"""
+    """Local JSON file se valid tokens load karne ka function"""
     if not os.path.exists(TOKENS_FILE):
         return []
     try:
         with open(TOKENS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data if isinstance(data, list) else []
+            
+        if not isinstance(data, list):
+            return []
+
+        valid_users = []
+        for item in data:
+            # Check for both "userId" and "userid" to avoid key error
+            userid = str(item.get("userId") or item.get("userid") or "").strip()
+            token = str(item.get("token", "")).strip()
+
+            # Ignore sync place-holders or dummy non-JWT tokens
+            if not token or token.startswith("#SYNC_ACCOUNT#") or not userid:
+                continue
+
+            valid_users.append({
+                "userid": userid,
+                "token": token,
+                "phone": str(item.get("phone", "")).strip() or userid
+            })
+
+        return valid_users
     except Exception as e:
         print(f"[ERROR] JSON File read failed: {e}")
         return []
 
 async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
-        # Memory mapping check
         mapping = COURSE_MAPPINGS.get(str(courseid))
         if not mapping:
             return {"status": 401, "msg": "No mapping found for this course. Hit /api/my-batches first."}
@@ -102,7 +121,6 @@ async def fetch_single_account_batches(token: str, userid: str, identifier: str)
                         "course_thumbnail": thumbnail
                     })
                     
-                    # Memory mapping save for subsequent API calls
                     COURSE_MAPPINGS[b_id] = {
                         "token": token,
                         "userid": userid
@@ -121,7 +139,7 @@ async def get_all_tokens_in_json():
     users = load_user_tokens()
     return {
         "status": "Success",
-        "total_tokens_count": len(users)
+        "valid_tokens_count": len(users)
     }
 
 
@@ -130,28 +148,26 @@ async def get_all_merged_batches():
     global CACHE_DATA
     current_time = time.time()
 
-    # Fast In-Memory Cache Check
     if CACHE_DATA["response"] and (current_time - CACHE_DATA["timestamp"] < CACHE_TTL):
         return CACHE_DATA["response"]
 
     users = load_user_tokens()
     if not users:
-        return {"status": 200, "message": "No tokens found in tokens.json file", "data": []}
+        return {"status": 200, "message": "No valid tokens found in tokens.json file", "data": []}
 
     combined_data = []
     seen_ids = set()
     api_tasks = []
 
     for item in users:
-        token = str(item.get("token", "")).strip()
-        userid = str(item.get("userid", "")).strip()
-        phone = str(item.get("phone", "")).strip() or userid
+        token = item["token"]
+        userid = item["userid"]
+        phone = item["phone"]
 
-        if token and userid:
-            api_tasks.append(fetch_single_account_batches(token, userid, phone))
+        api_tasks.append(fetch_single_account_batches(token, userid, phone))
 
     if not api_tasks:
-        return {"status": 400, "message": "Invalid tokens data format in JSON.", "data": []}
+        return {"status": 400, "message": "No valid token accounts available.", "data": []}
 
     results = await asyncio.gather(*api_tasks)
 
@@ -163,7 +179,7 @@ async def get_all_merged_batches():
 
     res = {
         "status": 200, 
-        "message": f"Fetched {len(combined_data)} unique batches from {len(api_tasks)} JSON accounts.", 
+        "message": f"Fetched {len(combined_data)} unique batches from {len(api_tasks)} active accounts.", 
         "data": combined_data
     }
     CACHE_DATA = {"timestamp": current_time, "response": res}
