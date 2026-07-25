@@ -43,11 +43,9 @@ def load_user_tokens():
 
         valid_users = []
         for item in data:
-            # Check for both "userId" and "userid" to avoid key error
             userid = str(item.get("userId") or item.get("userid") or "").strip()
             token = str(item.get("token", "")).strip()
 
-            # Ignore sync place-holders or dummy non-JWT tokens
             if not token or token.startswith("#SYNC_ACCOUNT#") or not userid:
                 continue
 
@@ -62,11 +60,19 @@ def load_user_tokens():
         print(f"[ERROR] JSON File read failed: {e}")
         return []
 
+
 async def fetch_api(endpoint: str, params: dict, courseid: str):
     try:
+        # Check if course mapping exists; if not, trigger batch loader
+        if str(courseid) not in COURSE_MAPPINGS:
+            await get_all_merged_batches()
+
         mapping = COURSE_MAPPINGS.get(str(courseid))
         if not mapping:
-            return {"status": 401, "msg": "No mapping found for this course. Hit /api/my-batches first."}
+            return {
+                "status": 401,
+                "msg": f"No token mapping found for courseid '{courseid}'. Ensure a valid account owns this course."
+            }
             
         headers = COMMON_HEADERS.copy()
         headers.update({
@@ -130,6 +136,15 @@ async def fetch_single_account_batches(token: str, userid: str, identifier: str)
         print(f"[ERROR - {identifier}] Fetch failed: {str(e)}")
         
     return batches_found
+
+
+# ================= LIFECYCLE EVENTS =================
+
+@app.on_event("startup")
+async def startup_event():
+    """Populate mappings automatically when the server starts."""
+    print("[INFO] Pre-loading batch mappings...")
+    await get_all_merged_batches()
 
 
 # ================= ENDPOINTS =================
